@@ -22,6 +22,9 @@ export default async function handler(req, res) {
       Authorization: `Bearer ${SENDGRID_API_KEY}`,
       'Content-Type': 'application/json'
     },
+
+    <div id="api-output" style="margin-top:15px; color:var(--primary); font-weight:700;"></div>
+
     body: JSON.stringify(payload)
   });
 
