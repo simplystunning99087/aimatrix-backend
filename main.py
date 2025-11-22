@@ -23,3 +23,15 @@ def root():
 def predict(input: PredictInput):
     score = len(input.text) / 100
     return {"input": input.text, "score": round(score, 3)}
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # You can replace * with your Netlify URL later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
