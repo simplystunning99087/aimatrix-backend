@@ -2,11 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import os
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from typing import Optional
 
 class ContactForm(BaseModel):
     name: str
@@ -18,16 +14,12 @@ class PredictInput(BaseModel):
 
 app = FastAPI(title="AIMatrix Backend API", version="1.0.0")
 
-# CORS - Allow your Netlify domain and local development
+# CORS - Allow all origins for now
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://your-netlify-app.netlify.app",  # ← UPDATE WITH YOUR ACTUAL NETLIFY URL
-        "https://*.netlify.app",                 # Wildcard for all Netlify subdomains
-    ],
+    allow_origins=["*"],  # Allow all origins temporarily
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -41,21 +33,21 @@ def root():
 
 @app.get("/health")
 def health_check():
-    return {
-        "status": "healthy", 
-        "timestamp": "2024-11-25T15:30:00Z"
-    }
+    return {"status": "healthy"}
 
+# ✅ FIXED: This endpoint was missing or misconfigured
 @app.post("/api/contact")
 async def submit_contact(form: ContactForm):
     try:
-        # Log the submission
-        logger.info(f"📧 New contact submission from: {form.name} ({form.email})")
+        print(f"📧 New contact form submission:")
+        print(f"Name: {form.name}")
+        print(f"Email: {form.email}")
+        print(f"Message: {form.message}")
         
         # In production, you would:
         # 1. Save to database
         # 2. Send email notification
-        # 3. Integrate with CRM
+        # 3. Log to your system
         
         return {
             "success": True,
@@ -67,33 +59,21 @@ async def submit_contact(form: ContactForm):
             }
         }
     except Exception as e:
-        logger.error(f"Contact form error: {str(e)}")
+        print(f"❌ Contact form error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/api/predict")
+@app.post("/predict")
 def predict(input: PredictInput):
-    try:
-        # Your ML prediction logic
-        score = len(input.text) / 100
-        
-        logger.info(f"🤖 Prediction request: {len(input.text)} chars")
-        
-        return {
-            "input": input.text, 
-            "score": round(score, 3),
-            "interpretation": "positive" if score > 0.5 else "neutral"
-        }
-    except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Prediction failed")
+    # Your ML prediction logic
+    score = len(input.text) / 100
+    return {
+        "input": input.text, 
+        "score": round(score, 3),
+        "interpretation": "positive" if score > 0.5 else "neutral"
+    }
 
 # For Render deployment
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=port)
