@@ -8,14 +8,17 @@ from io import StringIO
 import time
 from functools import wraps
 import shutil
+import requests
+import platform
+import psutil
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # ==================== CONFIGURATION ====================
 APP_NAME = "AIMatrix Backend"
-VERSION = "1.1.0"
-MAX_SUBMISSIONS_PER_MINUTE = 5  # Rate limiting
+VERSION = "2.0.0"
+MAX_SUBMISSIONS_PER_MINUTE = 10
 
 # ==================== DATABASE SETUP ====================
 def get_db_connection():
@@ -42,6 +45,16 @@ def init_db():
         )
     ''')
     
+    # Performance logs table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS performance_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            endpoint TEXT,
+            response_time REAL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -57,6 +70,19 @@ def track_performance(f):
         result = f(*args, **kwargs)
         end_time = time.time()
         response_time = end_time - start_time
+        
+        # Log performance to database
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO performance_logs (endpoint, response_time) VALUES (?, ?)',
+                (f.__name__, response_time)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Performance logging error: {e}")
         
         print(f"⏱️ {f.__name__} took {response_time:.2f} seconds")
         return result
@@ -81,36 +107,62 @@ def sanitize_input(text, max_length=1000):
     """Sanitize user input"""
     if not text:
         return ""
-    # Remove excessive whitespace and limit length
     return ' '.join(text.split())[:max_length]
 
 # ==================== EMAIL NOTIFICATIONS ====================
-def send_new_submission_email(submission_data):
-    """Send email notification for new submissions"""
+def send_production_email(submission_data):
+    """Send email using a real email service"""
     try:
-        subject = "🎯 New Contact Form Submission - AIMatrix"
-        body = f"""
-        NEW CONTACT FORM SUBMISSION
+        # Check if email service is configured
+        SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY')
+        SENDGRID_FROM_EMAIL = os.environ.get('SENDGRID_FROM_EMAIL')
+        ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@aimatrix.com')
         
-        Name: {submission_data['name']}
-        Email: {submission_data['email']}
-        Message: {submission_data['message']}
-        Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        IP: {submission_data.get('ip_address', 'N/A')}
+        if not all([SENDGRID_API_KEY, SENDGRID_FROM_EMAIL]):
+            # Fallback to console logging
+            print("📧 EMAIL NOTIFICATION (Configure SENDGRID_API_KEY and SENDGRID_FROM_EMAIL environment variables):")
+            print(f"New submission from: {submission_data['name']} ({submission_data['email']})")
+            print(f"Message: {submission_data['message'][:100]}...")
+            return True
         
-        View in admin: https://aimatrix-backend-6t9i.onrender.com/admin
+        # SendGrid integration
+        email_data = {
+            "personalizations": [{
+                "to": [{"email": ADMIN_EMAIL}],
+                "subject": f"🎯 New Contact: {submission_data['name']}"
+            }],
+            "from": {"email": SENDGRID_FROM_EMAIL},
+            "content": [{
+                "type": "text/plain",
+                "value": f"""
+New contact form submission:
+
+Name: {submission_data['name']}
+Email: {submission_data['email']}
+Message: {submission_data['message']}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+IP: {submission_data.get('ip_address', 'N/A')}
+
+View in admin: https://aimatrix-backend-6t9i.onrender.com/admin
+"""
+            }]
+        }
         
-        ---
-        AIMatrix Backend System
-        """
+        response = requests.post(
+            'https://api.sendgrid.com/v3/mail/send',
+            headers={'Authorization': f'Bearer {SENDGRID_API_KEY}', 'Content-Type': 'application/json'},
+            json=email_data
+        )
         
-        print("📧 EMAIL NOTIFICATION READY:")
-        print(f"Subject: {subject}")
-        print(f"Body: {body}")
-        
-        return True
+        if response.status_code == 202:
+            print("✅ Email sent successfully via SendGrid")
+            return True
+        else:
+            print(f"❌ Email failed: {response.status_code}")
+            return False
+            
     except Exception as e:
-        print(f"Email notification error: {e}")
+        print(f"Email error: {e}")
         return False
 
 # ==================== BASIC ENDPOINTS ====================
@@ -124,6 +176,14 @@ def health_check():
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) as count FROM contact_submissions')
         total_submissions = cursor.fetchone()['count']
+        
+        # Get performance stats
+        cursor.execute('''
+            SELECT AVG(response_time) as avg_response, MAX(response_time) as max_response
+            FROM performance_logs 
+            WHERE timestamp >= datetime("now", "-1 hour")
+        ''')
+        perf_stats = cursor.fetchone()
         conn.close()
         
         return jsonify({
@@ -132,7 +192,12 @@ def health_check():
             "data": {
                 "app": APP_NAME,
                 "version": VERSION,
+                "status": "operational",
                 "total_submissions": total_submissions,
+                "performance": {
+                    "avg_response_time": round(perf_stats['avg_response'] or 0, 3),
+                    "max_response_time": round(perf_stats['max_response'] or 0, 3)
+                },
                 "timestamp": datetime.now().isoformat()
             }
         })
@@ -150,17 +215,117 @@ def home():
         "success": True,
         "message": f"{APP_NAME} is running",
         "version": VERSION,
+        "timestamp": datetime.now().isoformat(),
         "endpoints": {
             "GET": [
                 "/", "/health", "/api/analytics", "/api/submissions", 
-                "/api/analytics/detailed", "/admin", "/api/submissions/export/csv"
+                "/api/analytics/detailed", "/admin", "/api/submissions/export/csv",
+                "/api/status", "/api/docs"
             ],
-            "POST": ["/api/contact"],
+            "POST": ["/api/contact", "/admin/backup"],
             "DELETE": ["/api/submissions/<id>"],
             "PUT": ["/api/submissions/<id>/status", "/api/submissions/<id>/archive"]
-        },
-        "timestamp": datetime.now().isoformat()
+        }
     })
+
+@app.route('/api/docs')
+@track_performance
+def api_documentation():
+    """API Documentation"""
+    return jsonify({
+        "success": True,
+        "message": "AIMatrix API Documentation",
+        "version": VERSION,
+        "endpoints": {
+            "GET": {
+                "/health": "Service health check with performance metrics",
+                "/api/analytics": "Basic analytics data",
+                "/api/analytics/detailed": "Detailed analytics with charts data",
+                "/api/submissions": "Get all submissions (supports status filter)",
+                "/api/status": "System status and monitoring",
+                "/api/submissions/export/csv": "Export submissions as CSV",
+                "/api/docs": "This documentation"
+            },
+            "POST": {
+                "/api/contact": "Submit contact form (requires: name, email, message)",
+                "/admin/backup": "Create database backup"
+            },
+            "PUT": {
+                "/api/submissions/<id>/status": "Update submission status"
+            },
+            "DELETE": {
+                "/api/submissions/<id>": "Delete a specific submission"
+            }
+        },
+        "examples": {
+            "contact_submission": {
+                "method": "POST",
+                "url": "/api/contact",
+                "body": {
+                    "name": "John Doe",
+                    "email": "john@example.com",
+                    "message": "Hello, I'm interested in your services!"
+                }
+            },
+            "update_status": {
+                "method": "PUT", 
+                "url": "/api/submissions/1/status",
+                "body": {
+                    "status": "read"
+                }
+            }
+        }
+    })
+
+@app.route('/api/status')
+@track_performance
+def system_status():
+    """Comprehensive system status endpoint"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Database info
+        cursor.execute('SELECT COUNT(*) as total FROM contact_submissions')
+        total_submissions = cursor.fetchone()['total']
+        
+        cursor.execute('SELECT COUNT(*) as today FROM contact_submissions WHERE DATE(submitted_at) = DATE("now")')
+        today_submissions = cursor.fetchone()['today']
+        
+        # Performance metrics
+        cursor.execute('''
+            SELECT 
+                endpoint,
+                AVG(response_time) as avg_response,
+                COUNT(*) as calls
+            FROM performance_logs 
+            WHERE timestamp >= datetime("now", "-1 hour")
+            GROUP BY endpoint
+        ''')
+        performance_data = cursor.fetchall()
+        
+        conn.close()
+        
+        # System info (basic)
+        system_info = {
+            "python_version": platform.python_version(),
+            "platform": platform.system(),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return jsonify({
+            "success": True,
+            "data": {
+                "submissions": {
+                    "total": total_submissions,
+                    "today": today_submissions
+                },
+                "performance": [dict(row) for row in performance_data],
+                "system": system_info
+            }
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 # ==================== CONTACT FORM ENDPOINT ====================
 @app.route('/api/contact', methods=['POST', 'GET'])
@@ -176,9 +341,6 @@ def contact_submit():
     
     try:
         data = request.get_json()
-        
-        # Debug logging
-        print("📥 Received contact form data:", data)
         
         # Validate required fields
         if not data:
@@ -223,7 +385,7 @@ def contact_submit():
         # Get client IP address
         ip_address = get_client_ip()
         
-        # Check rate limiting (basic implementation)
+        # Check rate limiting
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
@@ -253,7 +415,7 @@ def contact_submit():
         print(f"✅ Contact form submitted successfully (ID: {submission_id})")
         
         # Send email notification
-        send_new_submission_email({
+        send_production_email({
             'name': name,
             'email': email,
             'message': message,
@@ -281,7 +443,7 @@ def get_submissions():
     """Get all submissions with pagination"""
     try:
         status_filter = request.args.get('status', 'all')
-        limit = min(int(request.args.get('limit', 50)), 100)  # Max 100 records
+        limit = min(int(request.args.get('limit', 50)), 100)
         offset = int(request.args.get('offset', 0))
         
         conn = get_db_connection()
@@ -343,7 +505,7 @@ def get_submissions():
 @app.route('/api/submissions/<int:submission_id>', methods=['DELETE'])
 @track_performance
 def delete_submission(submission_id):
-    """Delete a specific submission - FIXED VERSION"""
+    """Delete a specific submission"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -381,7 +543,7 @@ def delete_submission(submission_id):
 @app.route('/api/submissions/<int:submission_id>/status', methods=['PUT'])
 @track_performance
 def update_submission_status(submission_id):
-    """Update submission status - FIXED VERSION"""
+    """Update submission status"""
     try:
         data = request.get_json()
         
@@ -572,13 +734,24 @@ def detailed_analytics():
         ''')
         hourly_data = cursor.fetchall()
         
+        # Top submitters
+        cursor.execute('''
+            SELECT email, COUNT(*) as submission_count
+            FROM contact_submissions 
+            GROUP BY email 
+            ORDER BY submission_count DESC 
+            LIMIT 10
+        ''')
+        top_submitters = cursor.fetchall()
+        
         conn.close()
         
         return jsonify({
             'success': True,
             'data': {
                 'daily_submissions': [dict(row) for row in daily_data],
-                'hourly_distribution': [dict(row) for row in hourly_data]
+                'hourly_distribution': [dict(row) for row in hourly_data],
+                'top_submitters': [dict(row) for row in top_submitters]
             }
         })
     except Exception as e:
@@ -642,10 +815,16 @@ def create_backup():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         backup_file = f'backup_{timestamp}.db'
         shutil.copy2('contact_submissions.db', backup_file)
+        
+        # Get backup size
+        backup_size = os.path.getsize(backup_file)
+        
         return jsonify({
             'success': True, 
             'message': 'Backup created successfully',
-            'backup_file': backup_file
+            'backup_file': backup_file,
+            'backup_size': backup_size,
+            'timestamp': timestamp
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -837,6 +1016,21 @@ def serve_admin():
             border: 1px solid #fecaca;
         }
         
+        .system-status {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #f1f5f9;
+        }
+        
         @media (max-width: 768px) {
             .header {
                 flex-direction: column;
@@ -856,16 +1050,17 @@ def serve_admin():
 <body>
     <div class="container">
         <div class="header">
-            <h1>📊 AIMatrix Admin Dashboard</h1>
+            <h1>📊 AIMatrix Admin Dashboard v2.0</h1>
             <div class="controls">
                 <button class="btn btn-primary" onclick="loadDashboard()">🔄 Refresh</button>
                 <button class="btn btn-success" onclick="exportData()">📤 Export CSV</button>
-                <button class="btn btn-warning" onclick="clearAllData()">🗑️ Clear All</button>
-                <button class="btn btn-primary" onclick="createBackup()">💾 Backup</button>
+                <button class="btn btn-warning" onclick="createBackup()">💾 Backup</button>
+                <button class="btn btn-primary" onclick="showSystemStatus()">📊 System Status</button>
             </div>
         </div>
         
         <div id="alert-container"></div>
+        <div id="system-status" class="system-status" style="display: none;"></div>
         
         <div class="stats" id="stats">
             <div class="loading">Loading analytics...</div>
@@ -891,7 +1086,6 @@ def serve_admin():
                 </div>
             `;
             
-            // Auto-hide after 5 seconds
             setTimeout(() => {
                 const alert = document.getElementById(alertId);
                 if (alert) alert.remove();
@@ -900,20 +1094,13 @@ def serve_admin():
         
         async function loadDashboard() {
             try {
-                console.log('Loading dashboard data...');
-                
-                // Show loading states
                 document.getElementById('stats').innerHTML = '<div class="loading">Loading analytics...</div>';
                 document.getElementById('submissions').innerHTML = '<div class="loading">Loading submissions...</div>';
                 
                 // Load analytics
                 const analyticsResponse = await fetch(BACKEND_URL + '/api/analytics');
-                if (!analyticsResponse.ok) {
-                    throw new Error('Analytics API failed: ' + analyticsResponse.status);
-                }
+                if (!analyticsResponse.ok) throw new Error('Analytics API failed');
                 const analytics = await analyticsResponse.json();
-                
-                console.log('Analytics data:', analytics);
                 
                 if (analytics.success) {
                     document.getElementById('stats').innerHTML = `
@@ -938,12 +1125,8 @@ def serve_admin():
                 
                 // Load submissions
                 const submissionsResponse = await fetch(BACKEND_URL + '/api/submissions');
-                if (!submissionsResponse.ok) {
-                    throw new Error('Submissions API failed: ' + submissionsResponse.status);
-                }
+                if (!submissionsResponse.ok) throw new Error('Submissions API failed');
                 const submissionsData = await submissionsResponse.json();
-                
-                console.log('Submissions data:', submissionsData);
                 
                 if (submissionsData.success) {
                     const submissions = submissionsData.data.submissions;
@@ -965,199 +1148,4 @@ def serve_admin():
                                     <div class="submission-header">
                                         <div>
                                             <strong>${sub.name}</strong> 
-                                            <span style="color: var(--muted);">• ${sub.email}</span>
-                                            <div class="submission-meta">
-                                                ${new Date(sub.submitted_at).toLocaleString()} • IP: ${sub.ip_address || 'N/A'}
-                                            </div>
-                                        </div>
-                                        <span class="status-badge status-${sub.status}">${sub.status}</span>
-                                    </div>
-                                    <p>${sub.message}</p>
-                                    <div class="submission-actions">
-                                        <button class="btn btn-success" onclick="markAsRead(${sub.id})">✓ Read</button>
-                                        <button class="btn btn-warning" onclick="markAsReplied(${sub.id})">📧 Replied</button>
-                                        <button class="btn btn-primary" onclick="archiveSubmission(${sub.id})">📁 Archive</button>
-                                        <button class="btn btn-danger" onclick="deleteSubmission(${sub.id})">🗑️ Delete</button>
-                                    </div>
-                                </div>
-                            `).join('')}
-                        </div>
-                    `;
-                }
-                
-            } catch (error) {
-                console.error('Dashboard error:', error);
-                showAlert('Error loading data: ' + error.message, 'error');
-            }
-        }
-        
-        async function markAsRead(submissionId) {
-            try {
-                const response = await fetch(BACKEND_URL + '/api/submissions/' + submissionId + '/status', {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ status: 'read' })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    showAlert('Submission marked as read');
-                    loadDashboard(); // Refresh the dashboard
-                } else {
-                    throw new Error(result.error);
-                }
-            } catch (error) {
-                showAlert('Error updating status: ' + error.message, 'error');
-            }
-        }
-        
-        async function markAsReplied(submissionId) {
-            try {
-                const response = await fetch(BACKEND_URL + '/api/submissions/' + submissionId + '/status', {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ status: 'replied' })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    showAlert('Submission marked as replied');
-                    loadDashboard(); // Refresh the dashboard
-                } else {
-                    throw new Error(result.error);
-                }
-            } catch (error) {
-                showAlert('Error updating status: ' + error.message, 'error');
-            }
-        }
-        
-        async function archiveSubmission(submissionId) {
-            try {
-                const response = await fetch(BACKEND_URL + '/api/submissions/' + submissionId + '/archive', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    }
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    showAlert('Submission archived successfully');
-                    loadDashboard(); // Refresh the dashboard
-                } else {
-                    throw new Error(result.error);
-                }
-            } catch (error) {
-                showAlert('Error archiving submission: ' + error.message, 'error');
-            }
-        }
-        
-        async function deleteSubmission(submissionId) {
-            if (confirm('Are you sure you want to delete this submission?')) {
-                try {
-                    const response = await fetch(BACKEND_URL + '/api/submissions/' + submissionId, {
-                        method: 'DELETE'
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (result.success) {
-                        showAlert('Submission deleted successfully');
-                        loadDashboard(); // Refresh the dashboard
-                    } else {
-                        throw new Error(result.error);
-                    }
-                } catch (error) {
-                    showAlert('Error deleting submission: ' + error.message, 'error');
-                }
-            }
-        }
-        
-        function exportData() {
-            window.open(BACKEND_URL + '/api/submissions/export/csv', '_blank');
-        }
-        
-        async function createBackup() {
-            try {
-                const response = await fetch(BACKEND_URL + '/admin/backup', {
-                    method: 'POST'
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    showAlert('Backup created successfully: ' + result.backup_file);
-                } else {
-                    throw new Error(result.error);
-                }
-            } catch (error) {
-                showAlert('Error creating backup: ' + error.message, 'error');
-            }
-        }
-        
-        async function clearAllData() {
-            if (confirm('⚠️ Are you absolutely sure? This will delete ALL submissions and cannot be undone!')) {
-                try {
-                    // Get all submissions first
-                    const submissionsResponse = await fetch(BACKEND_URL + '/api/submissions');
-                    const submissionsData = await submissionsResponse.json();
-                    
-                    if (submissionsData.success) {
-                        const submissions = submissionsData.data.submissions;
-                        
-                        // Delete all submissions one by one
-                        for (const sub of submissions) {
-                            await fetch(BACKEND_URL + '/api/submissions/' + sub.id, {
-                                method: 'DELETE'
-                            });
-                        }
-                        
-                        showAlert('All submissions cleared successfully');
-                        loadDashboard(); // Refresh the dashboard
-                    }
-                } catch (error) {
-                    showAlert('Error clearing data: ' + error.message, 'error');
-                }
-            }
-        }
-        
-        // Load dashboard on page load
-        document.addEventListener('DOMContentLoaded', function() {
-            loadDashboard();
-        });
-        
-        // Auto-refresh every 30 seconds
-        setInterval(loadDashboard, 30000);
-    </script>
-</body>
-</html>
-'''
-
-# ==================== ERROR HANDLING ====================
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        "success": False,
-        "error": "Endpoint not found",
-        "message": "The requested endpoint does not exist",
-        "available_endpoints": {
-            "GET": ["/", "/health", "/api/analytics", "/api/submissions", "/admin"],
-            "POST": ["/api/contact"],
-            "DELETE": ["/api/submissions/<id>"],
-            "PUT": ["/api/submissions/<id>/status"]
-        }
-    }), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        "success": False,
-        "error": "Internal server error",
-        "message": "Something went wrong on our
+                                            <span style="color: var(--muted);">• ${sub.email}</
