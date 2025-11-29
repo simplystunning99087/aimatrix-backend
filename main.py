@@ -1,18 +1,17 @@
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import os
 from datetime import datetime
 from typing import List, Optional
-import json
+from pydantic import BaseModel
 
 # Database setup
 DATABASE_URL = "aimatrix.db"
 
 def init_database():
     """Initialize the SQLite database"""
-    conn = sqlite3.connect(DATABASE_URL)
+    conn = sqlite3.connect(DABASE_URL)
     cursor = conn.cursor()
     
     # Create table if it doesn't exist
