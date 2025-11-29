@@ -1,266 +1,580 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from datetime import datetime
 import sqlite3
-import json
-import logging
 import os
-from email_validator import validate_email, EmailNotValidError
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from datetime import datetime, timedelta
+import csv
+from io import StringIO
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS for all routes
 
 # Database setup
-class DatabaseManager:
-    def __init__(self, db_path: str = "aimatrix.db"):
-        self.db_path = db_path
-        self.init_database()
-    
-    def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-    
-    def init_database(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Contact submissions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS contact_submissions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL,
-                message TEXT NOT NULL,
-                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                ip_address TEXT,
-                user_agent TEXT,
-                status TEXT DEFAULT 'new'
-            )
-        ''')
-        
-        # Analytics table for tracking
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS analytics_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                event_data TEXT,
-                user_ip TEXT,
-                user_agent TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("✅ Database initialized successfully")
+def get_db_connection():
+    conn = sqlite3.connect('contact_submissions.db')
+    conn.row_factory = sqlite3.Row
+    return conn
 
-db_manager = DatabaseManager()
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS contact_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            message TEXT NOT NULL,
+            ip_address TEXT,
+            status TEXT DEFAULT 'new',
+            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-def validate_email_address(email):
-    try:
-        validate_email(email)
-        return True
-    except EmailNotValidError:
-        return False
+# Initialize database
+init_db()
 
-def log_analytics_event(event_type, event_data, request):
-    try:
-        conn = db_manager.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO analytics_events (event_type, event_data, user_ip, user_agent)
-            VALUES (?, ?, ?, ?)
-        ''', (event_type, json.dumps(event_data), request.remote_addr, request.headers.get('User-Agent', '')))
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"📊 Analytics event logged: {event_type}")
-    except Exception as e:
-        logger.error(f"❌ Failed to log analytics event: {e}")
+# Serve admin.html from the backend
+@app.route('/admin')
+def serve_admin():
+    """Serve the admin dashboard"""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Admin Dashboard - AIMatrix</title>
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --primary: #f43f5e;
+                --dark: #0f172a;
+                --muted: #6b7280;
+                --bg: #f8fafc;
+                --card: #ffffff;
+                --success: #10b981;
+                --warning: #f59e0b;
+                --danger: #ef4444;
+            }
+            
+            body { 
+                font-family: 'Poppins', sans-serif; 
+                margin: 0; 
+                padding: 20px; 
+                background: var(--bg); 
+                color: var(--dark); 
+            }
+            
+            .container { 
+                max-width: 1400px; 
+                margin: 0 auto; 
+            }
+            
+            .header { 
+                display: flex; 
+                justify-content: space-between; 
+                align-items: center; 
+                margin-bottom: 30px; 
+                flex-wrap: wrap;
+                gap: 20px;
+            }
+            
+            .stats { 
+                display: grid; 
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+                gap: 20px; 
+                margin-bottom: 30px; 
+            }
+            
+            .stat-card { 
+                background: white; 
+                padding: 25px; 
+                border-radius: 12px; 
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+                text-align: center; 
+                border-left: 4px solid var(--primary);
+            }
+            
+            .stat-number { 
+                font-size: 2.5em; 
+                font-weight: 700; 
+                color: var(--primary); 
+                margin: 10px 0; 
+            }
+            
+            .controls {
+                display: flex;
+                gap: 15px;
+                margin: 20px 0;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 10px 20px;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: 600;
+                transition: all 0.3s ease;
+            }
+            
+            .btn-primary {
+                background: var(--primary);
+                color: white;
+            }
+            
+            .btn-success {
+                background: var(--success);
+                color: white;
+            }
+            
+            .btn-danger {
+                background: var(--danger);
+                color: white;
+            }
+            
+            .btn-warning {
+                background: var(--warning);
+                color: white;
+            }
+            
+            .submissions-grid {
+                display: grid;
+                gap: 15px;
+            }
+            
+            .submission-card {
+                background: white;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                border-left: 4px solid var(--success);
+            }
+            
+            .submission-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 10px;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            
+            .submission-meta {
+                color: var(--muted);
+                font-size: 12px;
+                margin: 5px 0;
+            }
+            
+            .submission-actions {
+                display: flex;
+                gap: 10px;
+                margin-top: 15px;
+                flex-wrap: wrap;
+            }
+            
+            .status-badge {
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            
+            .status-new { background: #dbeafe; color: #1e40af; }
+            .status-read { background: #dcfce7; color: #166534; }
+            .status-archived { background: #f3f4f6; color: #374151; }
+            
+            .loading { 
+                text-align: center; 
+                padding: 40px; 
+                color: var(--muted); 
+            }
+            
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: var(--muted);
+            }
+            
+            .alert {
+                padding: 15px;
+                border-radius: 8px;
+                margin: 10px 0;
+                display: none;
+            }
+            
+            .alert-success {
+                background: #dcfce7;
+                color: #166534;
+                border: 1px solid #bbf7d0;
+            }
+            
+            .alert-error {
+                background: #fee2e2;
+                color: #991b1b;
+                border: 1px solid #fecaca;
+            }
+            
+            @media (max-width: 768px) {
+                .header {
+                    flex-direction: column;
+                    align-items: flex-start;
+                }
+                
+                .stats {
+                    grid-template-columns: 1fr 1fr;
+                }
+                
+                .submission-actions {
+                    flex-direction: column;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📊 AIMatrix Admin Dashboard</h1>
+                <div class="controls">
+                    <button class="btn btn-primary" onclick="loadDashboard()">🔄 Refresh</button>
+                    <button class="btn btn-success" onclick="exportData()">📤 Export CSV</button>
+                    <button class="btn btn-warning" onclick="clearAllData()">🗑️ Clear All</button>
+                </div>
+            </div>
+            
+            <div id="alert-container"></div>
+            
+            <div class="stats" id="stats">
+                <div class="loading">Loading analytics...</div>
+            </div>
+            
+            <h2>📨 Contact Form Submissions</h2>
+            <div id="submissions">
+                <div class="loading">Loading submissions...</div>
+            </div>
+        </div>
 
-# ===== ROUTES =====
+        <script>
+            const BACKEND_URL = window.location.origin;
+            
+            function showAlert(message, type = 'success') {
+                const alertContainer = document.getElementById('alert-container');
+                const alertId = 'alert-' + Date.now();
+                alertContainer.innerHTML = `
+                    <div id="${alertId}" class="alert alert-${type}">
+                        ${message}
+                        <button onclick="document.getElementById('${alertId}').style.display='none'" 
+                                style="float: right; background: none; border: none; cursor: pointer;">✕</button>
+                    </div>
+                `;
+                document.getElementById(alertId).style.display = 'block';
+                
+                // Auto-hide after 5 seconds
+                setTimeout(() => {
+                    const alert = document.getElementById(alertId);
+                    if (alert) alert.style.display = 'none';
+                }, 5000);
+            }
+            
+            async function loadDashboard() {
+                try {
+                    // Show loading states
+                    document.getElementById('stats').innerHTML = '<div class="loading">Loading analytics...</div>';
+                    document.getElementById('submissions').innerHTML = '<div class="loading">Loading submissions...</div>';
+                    
+                    // Load analytics
+                    const analyticsResponse = await fetch(`${BACKEND_URL}/api/analytics`);
+                    const analytics = await analyticsResponse.json();
+                    
+                    if (analytics.success) {
+                        document.getElementById('stats').innerHTML = `
+                            <div class="stat-card">
+                                <div class="stat-number">${analytics.data.submissions.total}</div>
+                                <div>Total Submissions</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-number">${analytics.data.submissions.today}</div>
+                                <div>Today</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-number">${analytics.data.submissions.unique_emails}</div>
+                                <div>Unique Emails</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-number">${analytics.data.submissions.this_week}</div>
+                                <div>This Week</div>
+                            </div>
+                        `;
+                    }
+                    
+                    // Load submissions
+                    const submissionsResponse = await fetch(`${BACKEND_URL}/api/submissions`);
+                    const submissionsData = await submissionsResponse.json();
+                    
+                    if (submissionsData.success) {
+                        const submissions = submissionsData.data.submissions;
+                        
+                        if (submissions.length === 0) {
+                            document.getElementById('submissions').innerHTML = `
+                                <div class="empty-state">
+                                    <h3>No submissions yet</h3>
+                                    <p>Contact form submissions will appear here.</p>
+                                </div>
+                            `;
+                            return;
+                        }
+                        
+                        document.getElementById('submissions').innerHTML = `
+                            <div class="submissions-grid">
+                                ${submissions.map(sub => `
+                                    <div class="submission-card">
+                                        <div class="submission-header">
+                                            <div>
+                                                <strong>${sub.name}</strong> 
+                                                <span style="color: var(--muted);">• ${sub.email}</span>
+                                                <div class="submission-meta">
+                                                    ${new Date(sub.submitted_at).toLocaleString()} • IP: ${sub.ip_address}
+                                                </div>
+                                            </div>
+                                            <span class="status-badge status-${sub.status}">${sub.status}</span>
+                                        </div>
+                                        <p>${sub.message}</p>
+                                        <div class="submission-actions">
+                                            <button class="btn btn-success" onclick="markAsRead(${sub.id})">✓ Read</button>
+                                            <button class="btn btn-primary" onclick="replyTo('${sub.email}')">📧 Reply</button>
+                                            <button class="btn btn-danger" onclick="deleteSubmission(${sub.id})">🗑️ Delete</button>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `;
+                    }
+                    
+                } catch (error) {
+                    console.error('Dashboard error:', error);
+                    showAlert('Error loading data. Check console.', 'error');
+                }
+            }
+            
+            async function markAsRead(submissionId) {
+                try {
+                    const response = await fetch(`${BACKEND_URL}/api/submissions/${submissionId}/status`, {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ status: 'read' })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        showAlert('Submission marked as read');
+                        loadDashboard(); // Refresh the dashboard
+                    } else {
+                        throw new Error(result.error);
+                    }
+                } catch (error) {
+                    showAlert('Error updating status: ' + error.message, 'error');
+                }
+            }
+            
+            function replyTo(email) {
+                window.open(`mailto:${email}?subject=Re: Your AIMatrix Inquiry`, '_blank');
+            }
+            
+            async function deleteSubmission(submissionId) {
+                if (confirm('Are you sure you want to delete this submission?')) {
+                    try {
+                        const response = await fetch(`${BACKEND_URL}/api/submissions/${submissionId}`, {
+                            method: 'DELETE'
+                        });
+                        
+                        const result = await response.json();
+                        
+                        if (result.success) {
+                            showAlert('Submission deleted successfully');
+                            loadDashboard(); // Refresh the dashboard
+                        } else {
+                            throw new Error(result.error);
+                        }
+                    } catch (error) {
+                        showAlert('Error deleting submission: ' + error.message, 'error');
+                    }
+                }
+            }
+            
+            function exportData() {
+                window.open(`${BACKEND_URL}/api/submissions/export/csv`, '_blank');
+            }
+            
+            async function clearAllData() {
+                if (confirm('⚠️ Are you absolutely sure? This will delete ALL submissions and cannot be undone!')) {
+                    try {
+                        // Delete all submissions one by one
+                        const submissionsResponse = await fetch(`${BACKEND_URL}/api/submissions`);
+                        const submissionsData = await submissionsResponse.json();
+                        
+                        if (submissionsData.success) {
+                            const submissions = submissionsData.data.submissions;
+                            
+                            for (const sub of submissions) {
+                                await fetch(`${BACKEND_URL}/api/submissions/${sub.id}`, {
+                                    method: 'DELETE'
+                                });
+                            }
+                            
+                            showAlert('All submissions cleared successfully');
+                            loadDashboard(); // Refresh the dashboard
+                        }
+                    } catch (error) {
+                        showAlert('Error clearing data: ' + error.message, 'error');
+                    }
+                }
+            }
+            
+            // Load dashboard on page load and every 30 seconds
+            document.addEventListener('DOMContentLoaded', loadDashboard);
+            setInterval(loadDashboard, 30000);
+        </script>
+    </body>
+    </html>
+    """
 
-@app.route('/')
-def root():
-    return jsonify({
-        "status": "running",
-        "service": "AIMatrix Advanced Backend API",
-        "version": "3.0.0",
-        "features": ["contact", "analytics", "predictions", "admin"],
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
+# Health check endpoint
 @app.route('/health')
 def health_check():
-    try:
-        conn = db_manager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) as count FROM contact_submissions")
-        db_status = cursor.fetchone()["count"]
-        conn.close()
-        
-        return jsonify({
-            "success": True,
-            "message": "✅ System healthy",
-            "data": {
-                "database": "connected",
-                "submissions_count": db_status,
-                "server_time": datetime.utcnow().isoformat()
-            },
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": "❌ Health check failed",
-            "data": {"error": str(e)},
-            "timestamp": datetime.utcnow().isoformat()
-        }), 500
+    return jsonify({
+        "success": True,
+        "message": "Service is healthy",
+        "timestamp": datetime.now().isoformat()
+    })
 
+# Root endpoint
+@app.route('/')
+def home():
+    return jsonify({
+        "success": True,
+        "message": "AIMatrix Backend API is running",
+        "endpoints": {
+            "health": "/health",
+            "contact": "/api/contact",
+            "analytics": "/api/analytics", 
+            "submissions": "/api/submissions",
+            "admin": "/admin"
+        },
+        "timestamp": datetime.now().isoformat()
+    })
+
+# Contact form submission
 @app.route('/api/contact', methods=['POST'])
-def submit_contact():
+def contact_submit():
     try:
         data = request.get_json()
         
-        # Validation
-        if not data or not data.get('name') or not data['name'].strip():
-            return jsonify({"success": False, "error": "Name cannot be empty"}), 400
+        # Validate required fields
+        if not data or not data.get('name') or not data.get('email') or not data.get('message'):
+            return jsonify({
+                "success": False,
+                "error": "Missing required fields: name, email, message"
+            }), 400
         
-        if not data.get('email') or not validate_email_address(data['email']):
-            return jsonify({"success": False, "error": "Invalid email address"}), 400
+        # Get client IP address
+        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
         
-        if not data.get('message') or len(data['message'].strip()) < 10:
-            return jsonify({"success": False, "error": "Message must be at least 10 characters"}), 400
-        
-        # Save to database
-        conn = db_manager.get_connection()
+        # Insert into database
+        conn = get_db_connection()
         cursor = conn.cursor()
-        
         cursor.execute('''
-            INSERT INTO contact_submissions (name, email, message, ip_address, user_agent)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (
-            data['name'].strip(),
-            data['email'],
-            data['message'].strip(),
-            request.remote_addr,
-            request.headers.get('User-Agent', '')
-        ))
-        
-        submission_id = cursor.lastrowid
+            INSERT INTO contact_submissions (name, email, message, ip_address)
+            VALUES (?, ?, ?, ?)
+        ''', (data['name'], data['email'], data['message'], ip_address))
         conn.commit()
         conn.close()
         
-        # Log analytics
-        log_analytics_event("contact_submission", {
-            "submission_id": submission_id,
-            "email": data['email'],
-            "name_length": len(data['name']),
-            "message_length": len(data['message'])
-        }, request)
-        
-        logger.info(f"📧 New contact submission (ID: {submission_id}) from {data['email']}")
-        
         return jsonify({
             "success": True,
-            "message": "Thank you for your message! We'll get back to you within 24 hours.",
-            "data": {
-                "submission_id": submission_id,
-                "submitted_data": {
-                    "name": data['name'],
-                    "email": data['email'],
-                    "message_length": len(data['message'])
-                }
-            },
-            "timestamp": datetime.utcnow().isoformat()
+            "message": "Contact form submitted successfully",
+            "timestamp": datetime.now().isoformat()
         })
         
     except Exception as e:
-        logger.error(f"❌ Contact submission error: {e}")
-        return jsonify({"success": False, "error": "Internal server error"}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
+# Get all submissions
 @app.route('/api/submissions')
 def get_submissions():
     try:
-        limit = min(request.args.get('limit', 50, type=int), 100)  # Max 100
-        offset = request.args.get('offset', 0, type=int)
-        
-        conn = db_manager.get_connection()
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT * FROM contact_submissions 
-            ORDER BY submitted_at DESC 
-            LIMIT ? OFFSET ?
-        ''', (limit, offset))
-        
+            SELECT id, name, email, message, ip_address, status, submitted_at
+            FROM contact_submissions 
+            ORDER BY submitted_at DESC
+            LIMIT 50
+        ''')
         submissions = cursor.fetchall()
-        
-        cursor.execute('SELECT COUNT(*) as total FROM contact_submissions')
-        total_count = cursor.fetchone()["total"]
-        
         conn.close()
+        
+        submissions_list = []
+        for row in submissions:
+            submissions_list.append(dict(row))
         
         return jsonify({
             "success": True,
-            "message": f"Retrieved {len(submissions)} submissions",
+            "message": f"Retrieved {len(submissions_list)} submissions",
             "data": {
-                "submissions": [
-                    {
-                        "id": sub["id"],
-                        "name": sub["name"],
-                        "email": sub["email"],
-                        "message": sub["message"],
-                        "submitted_at": sub["submitted_at"],
-                        "ip_address": sub["ip_address"],
-                        "status": sub["status"]
-                    }
-                    for sub in submissions
-                ],
+                "submissions": submissions_list,
                 "pagination": {
-                    "total": total_count,
-                    "limit": limit,
-                    "offset": offset,
-                    "has_more": (offset + len(submissions)) < total_count
+                    "total": len(submissions_list),
+                    "limit": 50,
+                    "offset": 0,
+                    "has_more": False
                 }
             },
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now().isoformat()
         })
+        
     except Exception as e:
-        logger.error(f"❌ Submissions error: {e}")
-        return jsonify({"success": False, "error": f"Database error: {str(e)}"}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
+# Analytics endpoint
 @app.route('/api/analytics')
-def get_analytics():
+def analytics():
     try:
-        conn = db_manager.get_connection()
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         # Total submissions
-        cursor.execute('SELECT COUNT(*) as count FROM contact_submissions')
-        total_submissions = cursor.fetchone()["count"]
+        cursor.execute('SELECT COUNT(*) as total FROM contact_submissions')
+        total = cursor.fetchone()['total']
         
         # Today's submissions
-        cursor.execute('SELECT COUNT(*) as count FROM contact_submissions WHERE DATE(submitted_at) = DATE("now")')
-        today_submissions = cursor.fetchone()["count"]
+        cursor.execute('''
+            SELECT COUNT(*) as today FROM contact_submissions 
+            WHERE DATE(submitted_at) = DATE('now')
+        ''')
+        today = cursor.fetchone()['today']
         
         # This week's submissions
-        cursor.execute('SELECT COUNT(*) as count FROM contact_submissions WHERE submitted_at >= DATE("now", "-7 days")')
-        week_submissions = cursor.fetchone()["count"]
+        cursor.execute('''
+            SELECT COUNT(*) as this_week FROM contact_submissions 
+            WHERE submitted_at >= DATE('now', '-7 days')
+        ''')
+        this_week = cursor.fetchone()['this_week']
         
         # Unique emails
-        cursor.execute('SELECT COUNT(DISTINCT email) as count FROM contact_submissions')
-        unique_emails = cursor.fetchone()["count"]
-        
-        # Recent activity from analytics
-        cursor.execute('SELECT event_type, COUNT(*) as count FROM analytics_events WHERE created_at >= DATE("now", "-1 day") GROUP BY event_type')
-        recent_activity = {row["event_type"]: row["count"] for row in cursor.fetchall()}
+        cursor.execute('SELECT COUNT(DISTINCT email) as unique_emails FROM contact_submissions')
+        unique_emails = cursor.fetchone()['unique_emails']
         
         conn.close()
         
@@ -269,167 +583,119 @@ def get_analytics():
             "message": "Analytics data retrieved successfully",
             "data": {
                 "submissions": {
-                    "total": total_submissions,
-                    "today": today_submissions,
-                    "this_week": week_submissions,
+                    "total": total,
+                    "today": today,
+                    "this_week": this_week,
                     "unique_emails": unique_emails
-                },
-                "recent_activity": recent_activity,
-                "system_health": {
-                    "database": "connected",
-                    "api": "operational",
-                    "last_updated": datetime.utcnow().isoformat()
                 }
             },
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now().isoformat()
         })
+        
     except Exception as e:
-        logger.error(f"❌ Analytics error: {e}")
-        return jsonify({"success": False, "error": f"Analytics error: {str(e)}"}), 500
-
-@app.route('/api/predict', methods=['POST'])
-def predict():
-    try:
-        data = request.get_json()
-        
-        if not data or not data.get('text'):
-            return jsonify({"success": False, "error": "Text is required"}), 400
-            
-        text = data['text']
-        text_length = len(text)
-        word_count = len(text.split())
-        
-        # Advanced scoring
-        complexity_score = min(text_length / 200, 1.0)
-        sentiment_score = min(word_count / 50, 1.0)  # Placeholder for real sentiment analysis
-        
-        prediction_data = {
-            "input": text,
-            "analysis": {
-                "text_length": text_length,
-                "word_count": word_count,
-                "complexity_score": round(complexity_score, 3),
-                "sentiment_score": round(sentiment_score, 3),
-                "readability": "high" if complexity_score > 0.7 else "medium" if complexity_score > 0.4 else "low"
-            },
-            "interpretation": "positive" if sentiment_score > 0.6 else "neutral" if sentiment_score > 0.3 else "negative"
-        }
-        
-        # Log prediction event
-        log_analytics_event("prediction_made", {
-            "text_length": text_length,
-            "sentiment_score": sentiment_score,
-            "complexity_score": complexity_score
-        }, request)
-        
         return jsonify({
-            "success": True,
-            "message": "Prediction completed successfully",
-            "data": prediction_data,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        logger.error(f"❌ Prediction error: {e}")
-        return jsonify({"success": False, "error": f"Prediction error: {str(e)}"}), 500
+            "success": False,
+            "error": str(e)
+        }), 500
 
-@app.route('/api/analytics/event', methods=['POST'])
-def track_analytics_event():
+# NEW: Delete submission endpoint
+@app.route('/api/submissions/<int:submission_id>', methods=['DELETE'])
+def delete_submission(submission_id):
+    """Delete a specific submission"""
     try:
-        data = request.get_json()
-        event_type = data.get('event_type')
-        event_data = data.get('event_data', {})
-        
-        if not event_type:
-            return jsonify({"success": False, "error": "Event type is required"}), 400
-            
-        log_analytics_event(event_type, event_data, request)
-        
-        return jsonify({
-            "success": True,
-            "message": "Analytics event tracked successfully",
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        logger.error(f"❌ Analytics event error: {e}")
-        return jsonify({"success": False, "error": "Failed to track analytics event"}), 500
-
-@app.route('/api/health/detailed')
-def detailed_health_check():
-    try:
-        conn = db_manager.get_connection()
+        conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Database diagnostics
-        cursor.execute("SELECT COUNT(*) as count FROM contact_submissions")
-        submissions_count = cursor.fetchone()["count"]
-        
-        cursor.execute("SELECT COUNT(*) as count FROM analytics_events")
-        analytics_count = cursor.fetchone()["count"]
-        
-        cursor.execute('SELECT COUNT(*) as count FROM contact_submissions WHERE submitted_at >= DATETIME("now", "-1 hour")')
-        recent_submissions = cursor.fetchone()["count"]
-        
-        # Database size info
-        cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
-        db_size = cursor.fetchone()["size"]
-        
+        cursor.execute('DELETE FROM contact_submissions WHERE id = ?', (submission_id,))
+        conn.commit()
         conn.close()
         
         return jsonify({
-            "success": True,
-            "message": "Detailed system health check",
-            "data": {
-                "system": {
-                    "status": "healthy",
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "uptime": "running"
-                },
-                "database": {
-                    "status": "connected",
-                    "tables": {
-                        "contact_submissions": submissions_count,
-                        "analytics_events": analytics_count
-                    },
-                    "recent_activity": {
-                        "submissions_last_hour": recent_submissions
-                    },
-                    "size_bytes": db_size
-                },
-                "performance": {
-                    "response_time": "optimal",
-                    "memory_usage": "normal",
-                    "active_connections": 1
-                }
-            },
-            "timestamp": datetime.utcnow().isoformat()
+            'success': True,
+            'message': f'Submission {submission_id} deleted successfully'
         })
     except Exception as e:
-        logger.error(f"❌ Detailed health check error: {e}")
         return jsonify({
-            "success": False,
-            "message": "Health check failed",
-            "data": {"error": str(e)},
-            "timestamp": datetime.utcnow().isoformat()
+            'success': False,
+            'error': str(e)
         }), 500
 
-# Error handlers
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        "success": False,
-        "error": "Endpoint not found",
-        "message": "The requested endpoint does not exist"
-    }), 404
+# NEW: Export submissions as CSV
+@app.route('/api/submissions/export/csv')
+def export_submissions_csv():
+    """Export all submissions as CSV"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, name, email, message, ip_address, status, submitted_at 
+            FROM contact_submissions 
+            ORDER BY submitted_at DESC
+        ''')
+        submissions = cursor.fetchall()
+        conn.close()
+        
+        # Create CSV in memory
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow(['ID', 'Name', 'Email', 'Message', 'IP Address', 'Status', 'Submitted At'])
+        
+        # Write data
+        for sub in submissions:
+            writer.writerow([
+                sub['id'],
+                sub['name'],
+                sub['email'],
+                sub['message'],
+                sub['ip_address'],
+                sub['status'],
+                sub['submitted_at']
+            ])
+        
+        # Prepare response
+        output.seek(0)
+        return output.getvalue(), 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment;filename=aimatrix_submissions.csv'
+        }
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        "success": False,
-        "error": "Internal server error",
-        "message": "Something went wrong on our end"
-    }), 500
+# NEW: Update submission status
+@app.route('/api/submissions/<int:submission_id>/status', methods=['PUT'])
+def update_submission_status(submission_id):
+    """Update submission status"""
+    try:
+        data = request.get_json()
+        new_status = data.get('status', 'read')
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            'UPDATE contact_submissions SET status = ? WHERE id = ?',
+            (new_status, submission_id)
+        )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Submission {submission_id} status updated to {new_status}'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 Starting AIMatrix Flask Server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
