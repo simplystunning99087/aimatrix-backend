@@ -5,19 +5,31 @@ import os
 from datetime import datetime, timedelta
 import csv
 from io import StringIO
+import time
+from functools import wraps
+import shutil
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Database setup
+# ==================== CONFIGURATION ====================
+APP_NAME = "AIMatrix Backend"
+VERSION = "1.1.0"
+MAX_SUBMISSIONS_PER_MINUTE = 5  # Rate limiting
+
+# ==================== DATABASE SETUP ====================
 def get_db_connection():
+    """Get database connection with row factory"""
     conn = sqlite3.connect('contact_submissions.db')
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    """Initialize database with required tables"""
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Contact submissions table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS contact_submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,40 +41,132 @@ def init_db():
             submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
     conn.commit()
     conn.close()
 
 # Initialize database
 init_db()
 
-# Health check endpoint
-@app.route('/health')
-def health_check():
-    return jsonify({
-        "success": True,
-        "message": "Service is healthy",
-        "timestamp": datetime.now().isoformat()
-    })
+# ==================== PERFORMANCE TRACKING ====================
+def track_performance(f):
+    """Decorator to track API performance"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        start_time = time.time()
+        result = f(*args, **kwargs)
+        end_time = time.time()
+        response_time = end_time - start_time
+        
+        print(f"⏱️ {f.__name__} took {response_time:.2f} seconds")
+        return result
+    return decorated_function
 
-# Root endpoint
+# ==================== SECURITY & VALIDATION ====================
+def get_client_ip():
+    """Get client IP address safely"""
+    if request.headers.get('X-Forwarded-For'):
+        ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    else:
+        ip = request.remote_addr
+    return ip
+
+def is_valid_email(email):
+    """Basic email validation"""
+    import re
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+def sanitize_input(text, max_length=1000):
+    """Sanitize user input"""
+    if not text:
+        return ""
+    # Remove excessive whitespace and limit length
+    return ' '.join(text.split())[:max_length]
+
+# ==================== EMAIL NOTIFICATIONS ====================
+def send_new_submission_email(submission_data):
+    """Send email notification for new submissions"""
+    try:
+        subject = "🎯 New Contact Form Submission - AIMatrix"
+        body = f"""
+        NEW CONTACT FORM SUBMISSION
+        
+        Name: {submission_data['name']}
+        Email: {submission_data['email']}
+        Message: {submission_data['message']}
+        Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        IP: {submission_data.get('ip_address', 'N/A')}
+        
+        View in admin: https://aimatrix-backend-6t9i.onrender.com/admin
+        
+        ---
+        AIMatrix Backend System
+        """
+        
+        print("📧 EMAIL NOTIFICATION READY:")
+        print(f"Subject: {subject}")
+        print(f"Body: {body}")
+        
+        return True
+    except Exception as e:
+        print(f"Email notification error: {e}")
+        return False
+
+# ==================== BASIC ENDPOINTS ====================
+@app.route('/health')
+@track_performance
+def health_check():
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as count FROM contact_submissions')
+        total_submissions = cursor.fetchone()['count']
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "message": "Service is healthy",
+            "data": {
+                "app": APP_NAME,
+                "version": VERSION,
+                "total_submissions": total_submissions,
+                "timestamp": datetime.now().isoformat()
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
 @app.route('/')
+@track_performance
 def home():
+    """Root endpoint with API documentation"""
     return jsonify({
         "success": True,
-        "message": "AIMatrix Backend API is running",
+        "message": f"{APP_NAME} is running",
+        "version": VERSION,
         "endpoints": {
-            "health": "/health",
-            "contact": "/api/contact (POST)",
-            "analytics": "/api/analytics", 
-            "submissions": "/api/submissions",
-            "admin": "/admin"
+            "GET": [
+                "/", "/health", "/api/analytics", "/api/submissions", 
+                "/api/analytics/detailed", "/admin", "/api/submissions/export/csv"
+            ],
+            "POST": ["/api/contact"],
+            "DELETE": ["/api/submissions/<id>"],
+            "PUT": ["/api/submissions/<id>/status", "/api/submissions/<id>/archive"]
         },
         "timestamp": datetime.now().isoformat()
     })
 
-# Contact form submission
+# ==================== CONTACT FORM ENDPOINT ====================
 @app.route('/api/contact', methods=['POST', 'GET'])
+@track_performance
 def contact_submit():
+    """Contact form submission with rate limiting and validation"""
     if request.method == 'GET':
         return jsonify({
             "success": True,
@@ -83,36 +187,63 @@ def contact_submit():
                 "error": "No data received"
             }), 400
             
-        if not data.get('name'):
+        name = data.get('name', '').strip()
+        email = data.get('email', '').strip()
+        message = data.get('message', '').strip()
+        
+        if not name:
             return jsonify({
                 "success": False,
                 "error": "Missing required field: name"
             }), 400
             
-        if not data.get('email'):
+        if not email:
             return jsonify({
                 "success": False,
                 "error": "Missing required field: email"
             }), 400
             
-        if not data.get('message'):
+        if not is_valid_email(email):
+            return jsonify({
+                "success": False,
+                "error": "Invalid email format"
+            }), 400
+            
+        if not message:
             return jsonify({
                 "success": False,
                 "error": "Missing required field: message"
             }), 400
         
-        # Get client IP address
-        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ip_address and ',' in ip_address:
-            ip_address = ip_address.split(',')[0].strip()
+        # Sanitize inputs
+        name = sanitize_input(name, 100)
+        email = sanitize_input(email, 100)
+        message = sanitize_input(message, 2000)
         
-        # Insert into database
+        # Get client IP address
+        ip_address = get_client_ip()
+        
+        # Check rate limiting (basic implementation)
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
+            SELECT COUNT(*) as recent_count FROM contact_submissions 
+            WHERE ip_address = ? AND submitted_at >= datetime('now', '-1 minute')
+        ''', (ip_address,))
+        recent_count = cursor.fetchone()['recent_count']
+        
+        if recent_count >= MAX_SUBMISSIONS_PER_MINUTE:
+            conn.close()
+            return jsonify({
+                "success": False,
+                "error": "Too many submissions. Please try again in a minute."
+            }), 429
+        
+        # Insert into database
+        cursor.execute('''
             INSERT INTO contact_submissions (name, email, message, ip_address)
             VALUES (?, ?, ?, ?)
-        ''', (data['name'], data['email'], data['message'], ip_address))
+        ''', (name, email, message, ip_address))
         conn.commit()
         
         # Get the inserted ID
@@ -120,6 +251,14 @@ def contact_submit():
         conn.close()
         
         print(f"✅ Contact form submitted successfully (ID: {submission_id})")
+        
+        # Send email notification
+        send_new_submission_email({
+            'name': name,
+            'email': email,
+            'message': message,
+            'ip_address': ip_address
+        })
         
         return jsonify({
             "success": True,
@@ -135,25 +274,50 @@ def contact_submit():
             "error": str(e)
         }), 500
 
-# Get all submissions
+# ==================== SUBMISSIONS MANAGEMENT ====================
 @app.route('/api/submissions', methods=['GET'])
+@track_performance
 def get_submissions():
+    """Get all submissions with pagination"""
     try:
+        status_filter = request.args.get('status', 'all')
+        limit = min(int(request.args.get('limit', 50)), 100)  # Max 100 records
+        offset = int(request.args.get('offset', 0))
+        
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
+        query = '''
             SELECT id, name, email, message, ip_address, status, submitted_at
             FROM contact_submissions 
-            ORDER BY submitted_at DESC
-            LIMIT 50
-        ''')
+            WHERE 1=1
+        '''
+        params = []
+        
+        if status_filter != 'all':
+            query += ' AND status = ?'
+            params.append(status_filter)
+            
+        query += ' ORDER BY submitted_at DESC LIMIT ? OFFSET ?'
+        params.extend([limit, offset])
+        
+        cursor.execute(query, params)
         submissions = cursor.fetchall()
+        
+        # Get total count for pagination
+        count_query = 'SELECT COUNT(*) as total FROM contact_submissions WHERE 1=1'
+        count_params = []
+        
+        if status_filter != 'all':
+            count_query += ' AND status = ?'
+            count_params.append(status_filter)
+            
+        cursor.execute(count_query, count_params)
+        total = cursor.fetchone()['total']
+        
         conn.close()
         
-        submissions_list = []
-        for row in submissions:
-            submissions_list.append(dict(row))
+        submissions_list = [dict(row) for row in submissions]
         
         return jsonify({
             "success": True,
@@ -161,10 +325,10 @@ def get_submissions():
             "data": {
                 "submissions": submissions_list,
                 "pagination": {
-                    "total": len(submissions_list),
-                    "limit": 50,
-                    "offset": 0,
-                    "has_more": False
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": (offset + limit) < total
                 }
             },
             "timestamp": datetime.now().isoformat()
@@ -176,9 +340,152 @@ def get_submissions():
             "error": str(e)
         }), 500
 
-# Analytics endpoint
+@app.route('/api/submissions/<int:submission_id>', methods=['DELETE'])
+@track_performance
+def delete_submission(submission_id):
+    """Delete a specific submission - FIXED VERSION"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # First check if submission exists
+        cursor.execute('SELECT id FROM contact_submissions WHERE id = ?', (submission_id,))
+        submission = cursor.fetchone()
+        
+        if not submission:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': f'Submission {submission_id} not found'
+            }), 404
+        
+        # Delete the submission
+        cursor.execute('DELETE FROM contact_submissions WHERE id = ?', (submission_id,))
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ Submission {submission_id} deleted successfully")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Submission {submission_id} deleted successfully'
+        })
+        
+    except Exception as e:
+        print(f"❌ Delete submission error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/submissions/<int:submission_id>/status', methods=['PUT'])
+@track_performance
+def update_submission_status(submission_id):
+    """Update submission status - FIXED VERSION"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'No JSON data provided'
+            }), 400
+        
+        new_status = data.get('status')
+        
+        if not new_status:
+            return jsonify({
+                'success': False,
+                'error': 'Status field is required'
+            }), 400
+        
+        valid_statuses = ['new', 'read', 'archived', 'replied']
+        if new_status not in valid_statuses:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid status. Must be one of: {valid_statuses}'
+            }), 400
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # First check if submission exists
+        cursor.execute('SELECT id FROM contact_submissions WHERE id = ?', (submission_id,))
+        submission = cursor.fetchone()
+        
+        if not submission:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': f'Submission {submission_id} not found'
+            }), 404
+        
+        # Update the status
+        cursor.execute(
+            'UPDATE contact_submissions SET status = ? WHERE id = ?',
+            (new_status, submission_id)
+        )
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ Submission {submission_id} status updated to {new_status}")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Submission {submission_id} status updated to {new_status}'
+        })
+        
+    except Exception as e:
+        print(f"❌ Update status error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/submissions/<int:submission_id>/archive', methods=['POST'])
+@track_performance
+def archive_submission(submission_id):
+    """Archive a submission"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # First check if submission exists
+        cursor.execute('SELECT id FROM contact_submissions WHERE id = ?', (submission_id,))
+        submission = cursor.fetchone()
+        
+        if not submission:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': f'Submission {submission_id} not found'
+            }), 404
+        
+        cursor.execute(
+            'UPDATE contact_submissions SET status = "archived" WHERE id = ?',
+            (submission_id,)
+        )
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ Submission {submission_id} archived successfully")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Submission {submission_id} archived successfully'
+        })
+    except Exception as e:
+        print(f"❌ Archive submission error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# ==================== ANALYTICS ENDPOINTS ====================
 @app.route('/api/analytics', methods=['GET'])
+@track_performance
 def analytics():
+    """Basic analytics data"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -205,6 +512,15 @@ def analytics():
         cursor.execute('SELECT COUNT(DISTINCT email) as unique_emails FROM contact_submissions')
         unique_emails = cursor.fetchone()['unique_emails']
         
+        # Status distribution
+        cursor.execute('''
+            SELECT status, COUNT(*) as count 
+            FROM contact_submissions 
+            GROUP BY status
+        ''')
+        status_data = cursor.fetchall()
+        status_distribution = {row['status']: row['count'] for row in status_data}
+        
         conn.close()
         
         return jsonify({
@@ -216,7 +532,8 @@ def analytics():
                     "today": today,
                     "this_week": this_week,
                     "unique_emails": unique_emails
-                }
+                },
+                "status_distribution": status_distribution
             },
             "timestamp": datetime.now().isoformat()
         })
@@ -227,30 +544,49 @@ def analytics():
             "error": str(e)
         }), 500
 
-# Delete submission endpoint
-@app.route('/api/submissions/<int:submission_id>', methods=['DELETE'])
-def delete_submission(submission_id):
-    """Delete a specific submission"""
+@app.route('/api/analytics/detailed', methods=['GET'])
+@track_performance
+def detailed_analytics():
+    """Detailed analytics for charts and advanced reporting"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute('DELETE FROM contact_submissions WHERE id = ?', (submission_id,))
-        conn.commit()
+        # Last 7 days daily submissions
+        cursor.execute('''
+            SELECT DATE(submitted_at) as date, COUNT(*) as count 
+            FROM contact_submissions 
+            WHERE submitted_at >= DATE('now', '-7 days')
+            GROUP BY DATE(submitted_at) 
+            ORDER BY date
+        ''')
+        daily_data = cursor.fetchall()
+        
+        # Hourly distribution (last 24 hours)
+        cursor.execute('''
+            SELECT strftime('%H', submitted_at) as hour, COUNT(*) as count
+            FROM contact_submissions 
+            WHERE submitted_at >= datetime('now', '-1 day')
+            GROUP BY hour 
+            ORDER BY hour
+        ''')
+        hourly_data = cursor.fetchall()
+        
         conn.close()
         
         return jsonify({
             'success': True,
-            'message': f'Submission {submission_id} deleted successfully'
+            'data': {
+                'daily_submissions': [dict(row) for row in daily_data],
+                'hourly_distribution': [dict(row) for row in hourly_data]
+            }
         })
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-# Export submissions as CSV
+# ==================== EXPORT FUNCTIONALITY ====================
 @app.route('/api/submissions/export/csv', methods=['GET'])
+@track_performance
 def export_submissions_csv():
     """Export all submissions as CSV"""
     try:
@@ -297,35 +633,24 @@ def export_submissions_csv():
             'error': str(e)
         }), 500
 
-# Update submission status
-@app.route('/api/submissions/<int:submission_id>/status', methods=['PUT'])
-def update_submission_status(submission_id):
-    """Update submission status"""
+# ==================== BACKUP FUNCTIONALITY ====================
+@app.route('/admin/backup', methods=['POST'])
+@track_performance
+def create_backup():
+    """Create database backup"""
     try:
-        data = request.get_json()
-        new_status = data.get('status', 'read')
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            'UPDATE contact_submissions SET status = ? WHERE id = ?',
-            (new_status, submission_id)
-        )
-        conn.commit()
-        conn.close()
-        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = f'backup_{timestamp}.db'
+        shutil.copy2('contact_submissions.db', backup_file)
         return jsonify({
-            'success': True,
-            'message': f'Submission {submission_id} status updated to {new_status}'
+            'success': True, 
+            'message': 'Backup created successfully',
+            'backup_file': backup_file
         })
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-# Serve admin dashboard - COMPLETELY FIXED VERSION
+# ==================== ADMIN DASHBOARD ====================
 @app.route('/admin')
 def serve_admin():
     """Serve the admin dashboard"""
@@ -480,6 +805,7 @@ def serve_admin():
         .status-new { background: #dbeafe; color: #1e40af; }
         .status-read { background: #dcfce7; color: #166534; }
         .status-archived { background: #f3f4f6; color: #374151; }
+        .status-replied { background: #fef3c7; color: #92400e; }
         
         .loading { 
             text-align: center; 
@@ -535,6 +861,7 @@ def serve_admin():
                 <button class="btn btn-primary" onclick="loadDashboard()">🔄 Refresh</button>
                 <button class="btn btn-success" onclick="exportData()">📤 Export CSV</button>
                 <button class="btn btn-warning" onclick="clearAllData()">🗑️ Clear All</button>
+                <button class="btn btn-primary" onclick="createBackup()">💾 Backup</button>
             </div>
         </div>
         
@@ -648,7 +975,8 @@ def serve_admin():
                                     <p>${sub.message}</p>
                                     <div class="submission-actions">
                                         <button class="btn btn-success" onclick="markAsRead(${sub.id})">✓ Read</button>
-                                        <button class="btn btn-primary" onclick="replyTo('${sub.email}')">📧 Reply</button>
+                                        <button class="btn btn-warning" onclick="markAsReplied(${sub.id})">📧 Replied</button>
+                                        <button class="btn btn-primary" onclick="archiveSubmission(${sub.id})">📁 Archive</button>
                                         <button class="btn btn-danger" onclick="deleteSubmission(${sub.id})">🗑️ Delete</button>
                                     </div>
                                 </div>
@@ -686,8 +1014,49 @@ def serve_admin():
             }
         }
         
-        function replyTo(email) {
-            window.open('mailto:' + email + '?subject=Re: Your AIMatrix Inquiry', '_blank');
+        async function markAsReplied(submissionId) {
+            try {
+                const response = await fetch(BACKEND_URL + '/api/submissions/' + submissionId + '/status', {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ status: 'replied' })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert('Submission marked as replied');
+                    loadDashboard(); // Refresh the dashboard
+                } else {
+                    throw new Error(result.error);
+                }
+            } catch (error) {
+                showAlert('Error updating status: ' + error.message, 'error');
+            }
+        }
+        
+        async function archiveSubmission(submissionId) {
+            try {
+                const response = await fetch(BACKEND_URL + '/api/submissions/' + submissionId + '/archive', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert('Submission archived successfully');
+                    loadDashboard(); // Refresh the dashboard
+                } else {
+                    throw new Error(result.error);
+                }
+            } catch (error) {
+                showAlert('Error archiving submission: ' + error.message, 'error');
+            }
         }
         
         async function deleteSubmission(submissionId) {
@@ -713,6 +1082,24 @@ def serve_admin():
         
         function exportData() {
             window.open(BACKEND_URL + '/api/submissions/export/csv', '_blank');
+        }
+        
+        async function createBackup() {
+            try {
+                const response = await fetch(BACKEND_URL + '/admin/backup', {
+                    method: 'POST'
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert('Backup created successfully: ' + result.backup_file);
+                } else {
+                    throw new Error(result.error);
+                }
+            } catch (error) {
+                showAlert('Error creating backup: ' + error.message, 'error');
+            }
         }
         
         async function clearAllData() {
@@ -753,7 +1140,7 @@ def serve_admin():
 </html>
 '''
 
-# 404 handler for undefined routes
+# ==================== ERROR HANDLING ====================
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
@@ -768,6 +1155,9 @@ def not_found(error):
         }
     }), 404
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Internal server error",
+        "message": "Something went wrong on our
