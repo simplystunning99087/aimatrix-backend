@@ -1,557 +1,3 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import sqlite3
-import os
-from datetime import datetime, timedelta
-import csv
-from io import StringIO
-import time
-from functools import wraps
-import shutil
-import requests
-import json
-
-app = Flask(__name__)
-CORS(app)
-
-# ==================== CONFIGURATION ====================
-APP_NAME = "AIMatrix Backend"
-VERSION = "2.1.0"
-MAX_SUBMISSIONS_PER_MINUTE = 10
-
-# ==================== DATABASE SETUP ====================
-def get_db_connection():
-    conn = sqlite3.connect('contact_submissions.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS contact_submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL,
-            message TEXT NOT NULL,
-            ip_address TEXT,
-            status TEXT DEFAULT 'new',
-            priority TEXT DEFAULT 'normal',
-            tags TEXT,
-            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS email_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            submission_id INTEGER,
-            email_type TEXT,
-            status TEXT,
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (submission_id) REFERENCES contact_submissions (id)
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS system_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action TEXT,
-            details TEXT,
-            ip_address TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ==================== EMAIL SERVICE ====================
-def send_email_notification(submission_data, email_type="new_submission"):
-    """Send email notifications using Resend.com"""
-    try:
-        RESEND_API_KEY = os.environ.get('RESEND_API_KEY')
-        
-        if not RESEND_API_KEY:
-            print("📧 Email service not configured. Set RESEND_API_KEY environment variable.")
-            log_system_action("email_skipped", f"No API key for {email_type}")
-            return False
-        
-        if email_type == "new_submission":
-            subject = f"🎯 New Lead: {submission_data['name']}"
-            html_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    .container {{ max-width: 600px; margin: 0 auto; }}
-                    .header {{ background: linear-gradient(135deg, #f43f5e, #e11d48); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }}
-                    .content {{ padding: 20px; background: #f8fafc; }}
-                    .field {{ margin: 15px 0; }}
-                    .label {{ font-weight: bold; color: #64748b; }}
-                    .admin-link {{ display: inline-block; padding: 10px 20px; background: #f43f5e; color: white; text-decoration: none; border-radius: 5px; margin-top: 15px; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h1>🚀 New Contact Form Submission</h1>
-                    </div>
-                    <div class="content">
-                        <div class="field">
-                            <span class="label">Name:</span> {submission_data['name']}
-                        </div>
-                        <div class="field">
-                            <span class="label">Email:</span> {submission_data['email']}
-                        </div>
-                        <div class="field">
-                            <span class="label">Message:</span><br>
-                            {submission_data['message']}
-                        </div>
-                        <div class="field">
-                            <span class="label">Time:</span> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-                        </div>
-                        <div class="field">
-                            <span class="label">IP Address:</span> {submission_data.get('ip_address', 'N/A')}
-                        </div>
-                        <a href="https://aimatrix-backend-6t9i.onrender.com/admin" class="admin-link">
-                            📊 View in Admin Dashboard
-                        </a>
-                    </div>
-                </div>
-            </body>
-            </html>
-            """
-        else:
-            return False
-        
-        email_data = {
-            "from": "AIMatrix <notifications@aimatrix.tryrelay.cc>",
-            "to": ["manivelmtss@gmail.com"],
-            "subject": subject,
-            "html": html_content
-        }
-        
-        response = requests.post(
-            'https://api.resend.com/emails',
-            headers={'Authorization': f'Bearer {RESEND_API_KEY}', 'Content-Type': 'application/json'},
-            json=email_data,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            print("✅ Email sent successfully via Resend")
-            log_email(submission_data.get('id'), email_type, 'sent')
-            return True
-        else:
-            print(f"❌ Email failed: {response.status_code} - {response.text}")
-            log_email(submission_data.get('id'), email_type, 'failed')
-            return False
-            
-    except Exception as e:
-        print(f"Email error: {e}")
-        log_email(submission_data.get('id'), email_type, 'error')
-        return False
-
-def log_email(submission_id, email_type, status):
-    """Log email sending attempts"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO email_logs (submission_id, email_type, status) VALUES (?, ?, ?)',
-            (submission_id, email_type, status)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Email logging error: {e}")
-
-def log_system_action(action, details, ip_address=None):
-    """Log system actions for audit trail"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO system_logs (action, details, ip_address) VALUES (?, ?, ?)',
-            (action, details, ip_address)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"System logging error: {e}")
-
-# ==================== ENHANCED ANALYTICS ====================
-@app.route('/api/analytics/advanced', methods=['GET'])
-def advanced_analytics():
-    """Advanced analytics with charts data"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Time-based analytics
-        cursor.execute('''
-            SELECT 
-                DATE(submitted_at) as date,
-                COUNT(*) as count,
-                COUNT(DISTINCT email) as unique_emails
-            FROM contact_submissions 
-            WHERE submitted_at >= DATE('now', '-30 days')
-            GROUP BY DATE(submitted_at)
-            ORDER BY date
-        ''')
-        daily_analytics = cursor.fetchall()
-        
-        # Status analytics
-        cursor.execute('''
-            SELECT 
-                status,
-                COUNT(*) as count,
-                ROUND(AVG(LENGTH(message)), 2) as avg_message_length
-            FROM contact_submissions 
-            GROUP BY status
-        ''')
-        status_analytics = cursor.fetchall()
-        
-        # Hourly distribution
-        cursor.execute('''
-            SELECT 
-                strftime('%H', submitted_at) as hour,
-                COUNT(*) as count
-            FROM contact_submissions 
-            GROUP BY hour
-            ORDER BY hour
-        ''')
-        hourly_analytics = cursor.fetchall()
-        
-        # Email performance
-        cursor.execute('''
-            SELECT 
-                email_type,
-                status,
-                COUNT(*) as count
-            FROM email_logs 
-            GROUP BY email_type, status
-        ''')
-        email_analytics = cursor.fetchall()
-        
-        conn.close()
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'daily_trends': [dict(row) for row in daily_analytics],
-                'status_breakdown': [dict(row) for row in status_analytics],
-                'hourly_distribution': [dict(row) for row in hourly_analytics],
-                'email_performance': [dict(row) for row in email_analytics]
-            }
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-# ==================== ENHANCED SUBMISSIONS MANAGEMENT ====================
-@app.route('/api/submissions/bulk', methods=['POST'])
-def bulk_update_submissions():
-    """Bulk update submissions"""
-    try:
-        data = request.get_json()
-        submission_ids = data.get('submission_ids', [])
-        action = data.get('action')
-        
-        if not submission_ids or not action:
-            return jsonify({'success': False, 'error': 'Missing submission_ids or action'}), 400
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if action == 'delete':
-            placeholders = ','.join('?' * len(submission_ids))
-            cursor.execute(f'DELETE FROM contact_submissions WHERE id IN ({placeholders})', submission_ids)
-            log_system_action('bulk_delete', f'Deleted {len(submission_ids)} submissions')
-        elif action in ['read', 'archived', 'replied']:
-            placeholders = ','.join('?' * len(submission_ids))
-            cursor.execute(f'UPDATE contact_submissions SET status = ? WHERE id IN ({placeholders})', [action] + submission_ids)
-            log_system_action('bulk_update', f'Updated {len(submission_ids)} submissions to {action}')
-        
-        conn.commit()
-        conn.close()
-        
-        return jsonify({'success': True, 'message': f'Bulk {action} completed'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/submissions/<int:submission_id>/priority', methods=['PUT'])
-def update_submission_priority(submission_id):
-    """Update submission priority"""
-    try:
-        data = request.get_json()
-        priority = data.get('priority', 'normal')
-        
-        valid_priorities = ['low', 'normal', 'high', 'urgent']
-        if priority not in valid_priorities:
-            return jsonify({'success': False, 'error': f'Invalid priority. Must be one of: {valid_priorities}'}), 400
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            'UPDATE contact_submissions SET priority = ? WHERE id = ?',
-            (priority, submission_id)
-        )
-        conn.commit()
-        conn.close()
-        
-        log_system_action('priority_update', f'Submission {submission_id} priority set to {priority}')
-        
-        return jsonify({'success': True, 'message': f'Priority updated to {priority}'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/submissions/<int:submission_id>/tags', methods=['PUT'])
-def update_submission_tags(submission_id):
-    """Update submission tags"""
-    try:
-        data = request.get_json()
-        tags = data.get('tags', [])
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            'UPDATE contact_submissions SET tags = ? WHERE id = ?',
-            (json.dumps(tags), submission_id)
-        )
-        conn.commit()
-        conn.close()
-        
-        log_system_action('tags_update', f'Submission {submission_id} tags updated')
-        
-        return jsonify({'success': True, 'message': 'Tags updated successfully'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-# ==================== SYSTEM ENDPOINTS ====================
-@app.route('/api/system/logs')
-def get_system_logs():
-    """Get system logs"""
-    try:
-        limit = request.args.get('limit', 100)
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT * FROM system_logs 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        ''', (limit,))
-        
-        logs = cursor.fetchall()
-        conn.close()
-        
-        return jsonify({
-            'success': True,
-            'data': {'logs': [dict(row) for row in logs]}
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/system/health')
-def system_health():
-    """Comprehensive system health check"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Database stats
-        cursor.execute('SELECT COUNT(*) as total FROM contact_submissions')
-        total_submissions = cursor.fetchone()['total']
-        
-        cursor.execute('SELECT COUNT(*) as today FROM contact_submissions WHERE DATE(submitted_at) = DATE("now")')
-        today_submissions = cursor.fetchone()['today']
-        
-        cursor.execute('SELECT COUNT(*) as email_logs FROM email_logs')
-        email_logs_count = cursor.fetchone()['email_logs']
-        
-        # Performance metrics
-        cursor.execute('SELECT COUNT(*) as pending FROM contact_submissions WHERE status = "new"')
-        pending_submissions = cursor.fetchone()['pending']
-        
-        conn.close()
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'status': 'healthy',
-                'timestamp': datetime.now().isoformat(),
-                'metrics': {
-                    'total_submissions': total_submissions,
-                    'today_submissions': today_submissions,
-                    'pending_submissions': pending_submissions,
-                    'email_logs': email_logs_count,
-                    'uptime': '100%'
-                },
-                'services': {
-                    'database': 'connected',
-                    'email_service': 'configured' if os.environ.get('RESEND_API_KEY') else 'not_configured',
-                    'api': 'operational'
-                }
-            }
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-# ==================== EXISTING ENDPOINTS (Enhanced) ====================
-@app.route('/health')
-def health_check():
-    return jsonify({
-        "success": True,
-        "message": "Service is healthy",
-        "timestamp": datetime.now().isoformat(),
-        "version": VERSION
-    })
-
-@app.route('/')
-def home():
-    return jsonify({
-        "success": True,
-        "message": f"{APP_NAME} is running",
-        "version": VERSION,
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/api/contact', methods=['POST'])
-def contact_submit():
-    try:
-        data = request.get_json()
-        
-        if not data or not data.get('name') or not data.get('email') or not data.get('message'):
-            return jsonify({"success": False, "error": "Missing required fields"}), 400
-        
-        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO contact_submissions (name, email, message, ip_address)
-            VALUES (?, ?, ?, ?)
-        ''', (data['name'], data['email'], data['message'], ip_address))
-        conn.commit()
-        
-        submission_id = cursor.lastrowid
-        conn.close()
-        
-        # Send email notification
-        send_email_notification({
-            'id': submission_id,
-            'name': data['name'],
-            'email': data['email'],
-            'message': data['message'],
-            'ip_address': ip_address
-        })
-        
-        log_system_action('new_submission', f'New submission from {data["email"]}', ip_address)
-        
-        return jsonify({
-            "success": True,
-            "message": "Contact form submitted successfully",
-            "submission_id": submission_id
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/submissions', methods=['GET'])
-def get_submissions():
-    try:
-        status_filter = request.args.get('status', 'all')
-        priority_filter = request.args.get('priority', 'all')
-        limit = min(int(request.args.get('limit', 50)), 100)
-        offset = int(request.args.get('offset', 0))
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        query = 'SELECT * FROM contact_submissions WHERE 1=1'
-        params = []
-        
-        if status_filter != 'all':
-            query += ' AND status = ?'
-            params.append(status_filter)
-            
-        if priority_filter != 'all':
-            query += ' AND priority = ?'
-            params.append(priority_filter)
-            
-        query += ' ORDER BY submitted_at DESC LIMIT ? OFFSET ?'
-        params.extend([limit, offset])
-        
-        cursor.execute(query, params)
-        submissions = cursor.fetchall()
-        conn.close()
-        
-        submissions_list = []
-        for row in submissions:
-            submission = dict(row)
-            submission['tags'] = json.loads(submission['tags']) if submission['tags'] else []
-            submissions_list.append(submission)
-        
-        return jsonify({
-            "success": True,
-            "data": {"submissions": submissions_list}
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/analytics', methods=['GET'])
-def analytics():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT COUNT(*) as total FROM contact_submissions')
-        total = cursor.fetchone()['total']
-        
-        cursor.execute('SELECT COUNT(*) as today FROM contact_submissions WHERE DATE(submitted_at) = DATE("now")')
-        today = cursor.fetchone()['today']
-        
-        cursor.execute('SELECT COUNT(*) as this_week FROM contact_submissions WHERE submitted_at >= DATE("now", "-7 days")')
-        this_week = cursor.fetchone()['this_week']
-        
-        cursor.execute('SELECT COUNT(DISTINCT email) as unique_emails FROM contact_submissions')
-        unique_emails = cursor.fetchone()['unique_emails']
-        
-        cursor.execute('SELECT status, COUNT(*) as count FROM contact_submissions GROUP BY status')
-        status_data = cursor.fetchall()
-        status_distribution = {row['status']: row['count'] for row in status_data}
-        
-        cursor.execute('SELECT priority, COUNT(*) as count FROM contact_submissions GROUP BY priority')
-        priority_data = cursor.fetchall()
-        priority_distribution = {row['priority']: row['count'] for row in priority_data}
-        
-        conn.close()
-        
-        return jsonify({
-            "success": True,
-            "data": {
-                "submissions": {
-                    "total": total,
-                    "today": today,
-                    "this_week": this_week,
-                    "unique_emails": unique_emails
-                },
-                "status_distribution": status_distribution,
-                "priority_distribution": priority_distribution
-            }
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
 # ==================== ADMIN DASHBOARD ====================
 @app.route('/admin')
 def serve_admin():
@@ -1002,4 +448,381 @@ def serve_admin():
                         label: 'Submissions',
                         data: [12, 19, 8, 15, 12, 18, 14],
                         borderColor: '#f43f5e',
-                        backgroundColor: '
+                        backgroundColor: 'rgba(244, 63, 94, 0.1)',
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false
+                }
+            });
+            
+            // Status Chart
+            const statusCtx = document.getElementById('statusChart').getContext('2d');
+            if (statusChart) statusChart.destroy();
+            
+            statusChart = new Chart(statusCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['New', 'Read', 'Replied', 'Archived'],
+                    datasets: [{
+                        data: [
+                            data.status_distribution.new || 0,
+                            data.status_distribution.read || 0,
+                            data.status_distribution.replied || 0,
+                            data.status_distribution.archived || 0
+                        ],
+                        backgroundColor: [
+                            '#dbeafe',
+                            '#dcfce7',
+                            '#fef3c7',
+                            '#f3f4f6'
+                        ],
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false
+                }
+            });
+        }
+        
+        async function loadSubmissions() {
+            try {
+                const status = document.getElementById('status-filter').value;
+                const priority = document.getElementById('priority-filter').value;
+                
+                const response = await fetch(`${BACKEND_URL}/api/submissions?status=${status}&priority=${priority}`);
+                if (!response.ok) throw new Error('Failed to load submissions');
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    const submissionsDiv = document.getElementById('submissions');
+                    
+                    if (result.data.submissions.length === 0) {
+                        submissionsDiv.innerHTML = `
+                            <div class="empty-state">
+                                <i class="fas fa-inbox" style="font-size: 48px; margin-bottom: 20px;"></i>
+                                <h3>No submissions found</h3>
+                                <p>Try changing your filters or check back later.</p>
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    submissionsDiv.innerHTML = `
+                        <div class="submissions-grid">
+                            ${result.data.submissions.map(sub => `
+                                <div class="submission-card" data-id="${sub.id}">
+                                    <div class="submission-header">
+                                        <div>
+                                            <h4>${sub.name}</h4>
+                                            <div class="submission-meta">${sub.email}</div>
+                                        </div>
+                                        <div>
+                                            <span class="status-badge status-${sub.status}">${sub.status}</span>
+                                            <span class="priority-badge priority-${sub.priority}">${sub.priority}</span>
+                                        </div>
+                                    </div>
+                                    <p>${sub.message}</p>
+                                    <div class="submission-meta">
+                                        <i class="far fa-clock"></i> ${new Date(sub.submitted_at).toLocaleString()}
+                                        <i class="fas fa-globe"></i> ${sub.ip_address || 'Unknown IP'}
+                                    </div>
+                                    <div class="submission-actions">
+                                        <input type="checkbox" class="bulk-select" data-id="${sub.id}" onchange="toggleSelection(${sub.id})">
+                                        <button class="btn btn-success btn-sm" onclick="updateSubmission(${sub.id}, 'read')">
+                                            <i class="fas fa-eye"></i> Read
+                                        </button>
+                                        <button class="btn btn-warning btn-sm" onclick="updateSubmission(${sub.id}, 'replied')">
+                                            <i class="fas fa-reply"></i> Replied
+                                        </button>
+                                        <button class="btn btn-info btn-sm" onclick="updateSubmission(${sub.id}, 'archived')">
+                                            <i class="fas fa-archive"></i> Archive
+                                        </button>
+                                        <button class="btn btn-danger btn-sm" onclick="deleteSubmission(${sub.id})">
+                                            <i class="fas fa-trash"></i> Delete
+                                        </button>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                console.error('Error loading submissions:', error);
+                showAlert('Error loading submissions: ' + error.message, 'error');
+            }
+        }
+        
+        // The rest of your JavaScript functions continue here...
+        // You need to add the missing JavaScript functions
+        
+        function toggleSelection(id) {
+            if (selectedSubmissions.has(id)) {
+                selectedSubmissions.delete(id);
+            } else {
+                selectedSubmissions.add(id);
+            }
+            document.getElementById('selected-count').textContent = `${selectedSubmissions.size} submissions selected`;
+        }
+        
+        function toggleBulkActions() {
+            const bulkDiv = document.getElementById('bulk-actions');
+            bulkDiv.style.display = bulkDiv.style.display === 'none' ? 'block' : 'none';
+        }
+        
+        async function bulkUpdate(action) {
+            if (selectedSubmissions.size === 0) {
+                showAlert('Please select submissions first', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/submissions/bulk`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        submission_ids: Array.from(selectedSubmissions),
+                        action: action
+                    })
+                });
+                
+                const result = await response.json();
+                if (result.success) {
+                    showAlert(result.message);
+                    selectedSubmissions.clear();
+                    loadSubmissions();
+                    loadDashboard();
+                } else {
+                    showAlert(result.error, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        async function bulkDelete() {
+            if (!confirm(`Are you sure you want to delete ${selectedSubmissions.size} submissions?`)) return;
+            
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/submissions/bulk`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        submission_ids: Array.from(selectedSubmissions),
+                        action: 'delete'
+                    })
+                });
+                
+                const result = await response.json();
+                if (result.success) {
+                    showAlert(result.message);
+                    selectedSubmissions.clear();
+                    loadSubmissions();
+                    loadDashboard();
+                } else {
+                    showAlert(result.error, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+        }
+        
+        async function updateSubmission(id, status) {
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/submissions/${id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status })
+                });
+                
+                const result = await response.json();
+                if (result.success) {
+                    showAlert('Submission updated');
+                    loadSubmissions();
+                }
+            } catch (error) {
+                showAlert('Error updating submission: ' + error.message, 'error');
+            }
+        }
+        
+        async function deleteSubmission(id) {
+            if (!confirm('Are you sure you want to delete this submission?')) return;
+            
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/submissions/${id}`, {
+                    method: 'DELETE'
+                });
+                
+                const result = await response.json();
+                if (result.success) {
+                    showAlert('Submission deleted');
+                    loadSubmissions();
+                    loadDashboard();
+                }
+            } catch (error) {
+                showAlert('Error deleting submission: ' + error.message, 'error');
+            }
+        }
+        
+        async function exportData() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/submissions/export`);
+                if (!response.ok) throw new Error('Export failed');
+                
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `submissions_${new Date().toISOString().split('T')[0]}.csv`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                
+                showAlert('Data exported successfully');
+            } catch (error) {
+                showAlert('Export error: ' + error.message, 'error');
+            }
+        }
+        
+        async function showSystemHealth() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/system/health`);
+                if (!response.ok) throw new Error('Health check failed');
+                
+                const result = await response.json();
+                const healthDiv = document.getElementById('system-health');
+                
+                if (result.success) {
+                    healthDiv.innerHTML = `
+                        <h3><i class="fas fa-heartbeat"></i> System Health</h3>
+                        <div class="status-item">
+                            <span>Status:</span>
+                            <span style="color: ${result.data.status === 'healthy' ? 'var(--success)' : 'var(--danger)'}">
+                                <i class="fas fa-${result.data.status === 'healthy' ? 'check-circle' : 'exclamation-circle'}"></i>
+                                ${result.data.status}
+                            </span>
+                        </div>
+                        <div class="status-item">
+                            <span>Total Submissions:</span>
+                            <span>${result.data.metrics.total_submissions}</span>
+                        </div>
+                        <div class="status-item">
+                            <span>Today's Submissions:</span>
+                            <span>${result.data.metrics.today_submissions}</span>
+                        </div>
+                        <div class="status-item">
+                            <span>Pending:</span>
+                            <span>${result.data.metrics.pending_submissions}</span>
+                        </div>
+                        <div class="status-item">
+                            <span>Database:</span>
+                            <span style="color: var(--success)">
+                                <i class="fas fa-check-circle"></i> Connected
+                            </span>
+                        </div>
+                        <div class="status-item">
+                            <span>Email Service:</span>
+                            <span style="color: ${result.data.services.email_service === 'configured' ? 'var(--success)' : 'var(--warning)'}">
+                                <i class="fas fa-${result.data.services.email_service === 'configured' ? 'check-circle' : 'exclamation-triangle'}"></i>
+                                ${result.data.services.email_service}
+                            </span>
+                        </div>
+                        <button class="btn btn-primary" onclick="healthDiv.style.display = 'none'" style="margin-top: 15px;">
+                            Close
+                        </button>
+                    `;
+                    healthDiv.style.display = 'block';
+                }
+            } catch (error) {
+                showAlert('Health check error: ' + error.message, 'error');
+            }
+        }
+        
+        async function showAdvancedAnalytics() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/analytics/advanced`);
+                if (!response.ok) throw new Error('Analytics failed');
+                
+                const result = await response.json();
+                const analyticsDiv = document.getElementById('advanced-analytics');
+                
+                if (result.success) {
+                    analyticsDiv.innerHTML = `
+                        <h4>Daily Trends (Last 30 Days)</h4>
+                        <div style="max-height: 300px; overflow-y: auto;">
+                            ${result.data.daily_trends.map(day => `
+                                <div class="status-item">
+                                    <span>${day.date}:</span>
+                                    <span>${day.count} submissions (${day.unique_emails} unique)</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                        <h4 style="margin-top: 20px;">Email Performance</h4>
+                        ${result.data.email_performance.map(email => `
+                            <div class="status-item">
+                                <span>${email.email_type}:</span>
+                                <span>${email.status} (${email.count})</span>
+                            </div>
+                        `).join('')}
+                    `;
+                    
+                    // Show the system health div to display analytics
+                    const healthDiv = document.getElementById('system-health');
+                    healthDiv.innerHTML = analyticsDiv.innerHTML;
+                    healthDiv.style.display = 'block';
+                }
+            } catch (error) {
+                showAlert('Analytics error: ' + error.message, 'error');
+            }
+        }
+        
+        async function loadAdvancedAnalytics() {
+            await showAdvancedAnalytics();
+        }
+        
+        async function loadSystemLogs() {
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/system/logs`);
+                if (!response.ok) throw new Error('Failed to load logs');
+                
+                const result = await response.json();
+                const logsDiv = document.getElementById('system-logs');
+                
+                if (result.success) {
+                    logsDiv.innerHTML = `
+                        <h4>Recent System Logs</h4>
+                        <div style="max-height: 400px; overflow-y: auto;">
+                            ${result.data.logs.map(log => `
+                                <div class="status-item">
+                                    <div>
+                                        <strong>${log.action}</strong><br>
+                                        <small>${log.details}</small>
+                                    </div>
+                                    <div style="text-align: right;">
+                                        <small>${new Date(log.timestamp).toLocaleString()}</small><br>
+                                        <small>${log.ip_address || 'N/A'}</small>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                showAlert('Error loading logs: ' + error.message, 'error');
+            }
+        }
+        
+        // Initialize dashboard on load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+        });
+    </script>
+</body>
+</html>
+'''  # <-- THIS WAS MISSING! You need this closing triple quote
