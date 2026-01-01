@@ -259,9 +259,157 @@ def delete_message(msg_id):
         db.session.commit()
     return redirect('/admin')
 
-# Initialize
+# --- MODELS ---
+class ContactMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    email = db.Column(db.String(100))
+    message = db.Column(db.Text)
+    date = db.Column(db.DateTime, default=datetime.utcnow)
+
+# NEW: User Account Model
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False) # Stores hashed password
+    company = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# --- ROUTES ---
+@app.route('/')
+def home():
+    return jsonify({"status": "Online", "mode": "Commercial"})
+
+# 1. NEW REGISTER ROUTE
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    
+    # Check if user already exists
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({"success": False, "error": "Email already registered"}), 400
+    
+    # Securely hash the password (never store plain text!)
+    hashed_pw = generate_password_hash(data['password'], method='pbkdf2:sha256')
+    
+    new_user = User(
+        name=data['name'], 
+        email=data['email'], 
+        password=hashed_pw,
+        company=data.get('company', '')
+    )
+    
+    try:
+        db.session.add(new_user)
+        db.session.commit()
+        return jsonify({"success": True, "message": "Account created!"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# 2. CONTACT FORM
+@app.route('/api/contact', methods=['POST'])
+def contact():
+    data = request.json
+    try:
+        new_msg = ContactMessage(
+            name=data.get('name'), 
+            email=data.get('email'), 
+            message=data.get('message')
+        )
+        db.session.add(new_msg)
+        db.session.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# 3. ANALYTICS
+@app.route('/api/analytics')
+def analytics():
+    total = ContactMessage.query.count()
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    today = ContactMessage.query.filter(ContactMessage.date >= today_start).count()
+    unique = db.session.query(ContactMessage.email).distinct().count()
+    
+    return jsonify({
+        "success": True, 
+        "data": { "submissions": { "total": total, "today": today, "unique_emails": unique } }
+    })
+
+# 4. ADMIN DASHBOARD (Includes Users Tab)
+@app.route('/admin')
+def admin_panel():
+    messages = ContactMessage.query.order_by(ContactMessage.date.desc()).all()
+    users = User.query.order_by(User.created_at.desc()).all() # Fetch users
+    
+    # Simple Admin with Tabs
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-gray-100 font-sans p-8">
+        <div class="max-w-6xl mx-auto">
+            <h1 class="text-3xl font-bold text-gray-800 mb-8">🚀 AIMatrix Admin</h1>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div class="bg-white rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-bold mb-4 border-b pb-2 text-blue-600">📩 Recent Messages</h2>
+                    <div class="overflow-auto h-96">
+                        <table class="w-full text-sm">
+                            <thead class="text-left text-gray-500"><tr><th class="pb-2">From</th><th class="pb-2">Message</th></tr></thead>
+                            <tbody>
+                                {% for msg in messages %}
+                                <tr class="border-b border-gray-100 hover:bg-gray-50">
+                                    <td class="py-3">
+                                        <p class="font-bold">{{ msg.name }}</p>
+                                        <p class="text-xs text-gray-400">{{ msg.email }}</p>
+                                    </td>
+                                    <td class="py-3 text-gray-600">{{ msg.message }}</td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="2" class="text-center py-4 text-gray-400">No messages yet</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-bold mb-4 border-b pb-2 text-green-600">👥 Registered Clients</h2>
+                    <div class="overflow-auto h-96">
+                        <table class="w-full text-sm">
+                            <thead class="text-left text-gray-500"><tr><th class="pb-2">Client</th><th class="pb-2">Company</th><th class="pb-2">Joined</th></tr></thead>
+                            <tbody>
+                                {% for user in users %}
+                                <tr class="border-b border-gray-100 hover:bg-gray-50">
+                                    <td class="py-3">
+                                        <p class="font-bold">{{ user.name }}</p>
+                                        <p class="text-xs text-gray-400">{{ user.email }}</p>
+                                    </td>
+                                    <td class="py-3 text-gray-500">{{ user.company or 'N/A' }}</td>
+                                    <td class="py-3 text-xs text-gray-400">{{ user.created_at.strftime('%Y-%m-%d') }}</td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="3" class="text-center py-4 text-gray-400">No registered users</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html, messages=messages, users=users)
+
 with app.app_context():
     db.create_all()
 
 if __name__ == '__main__':
     app.run(debug=True)
+
