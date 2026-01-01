@@ -1,14 +1,15 @@
-const API_URL = "https://aimatrix-backend-6t9i.onrender.com"; // Your actual backend URL
+// CONFIGURATION
+const API_BASE_URL = "https://aimatrix-backend-6t9i.onrender.com"; // Your Render Backend URL
 
-// 1. Handle Contact Form
-const contactForm = document.getElementById('contact-form'); // Ensure your HTML form has id="contact-form"
+// --- 1. CONTACT FORM LOGIC ---
+const contactForm = document.getElementById('contact-form');
 if (contactForm) {
     contactForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const submitBtn = contactForm.querySelector('button');
-        const originalText = submitBtn.innerText;
-        submitBtn.innerText = "Sending...";
-        
+        const btn = contactForm.querySelector('button');
+        const originalText = btn.innerText;
+        btn.innerText = "Sending...";
+
         const formData = {
             name: document.getElementById('name').value,
             email: document.getElementById('email').value,
@@ -16,77 +17,101 @@ if (contactForm) {
         };
 
         try {
-            const res = await fetch(`${API_URL}/api/contact`, {
+            const res = await fetch(`${API_BASE_URL}/api/contact`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(formData)
             });
             const data = await res.json();
-            alert(data.message);
-            contactForm.reset();
-        } catch (error) {
-            console.error(error);
-            alert("Error sending message.");
+            
+            if (res.ok) {
+                alert("Success: " + data.message);
+                contactForm.reset();
+            } else {
+                alert("Error: " + data.error);
+            }
+        } catch (err) {
+            console.error(err);
+            alert("Network error. Please try again.");
         } finally {
-            submitBtn.innerText = originalText;
+            btn.innerText = originalText;
         }
     });
 }
 
-// 2. Handle Payments (Razorpay)
-// Call this function when a user clicks a "Buy" button
-async function initiatePayment(planAmount, planName) {
-    try {
-        // Step 1: Create Order on Backend
-        const res = await fetch(`${API_URL}/api/create-order`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ amount: planAmount * 100 }) // Convert to paise
-        });
-        const order = await res.json();
+// --- 2. LOGIN LOGIC ---
+// Ensure your Login HTML form has id="login-form"
+const loginForm = document.getElementById('login-form');
+if (loginForm) {
+    loginForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const email = document.getElementById('email').value;
+        const password = document.getElementById('password').value;
 
-        // Step 2: Open Razorpay Checkout
-        var options = {
-            "key": "YOUR_RAZORPAY_KEY_ID", // Replace with your PUBLIC Key ID from Razorpay
-            "amount": order.amount, 
-            "currency": "INR",
-            "name": "AIMatrix",
-            "description": `Upgrade to ${planName}`,
-            "order_id": order.id, 
-            "handler": async function (response) {
-                // Step 3: Verify Payment on Backend
-                const verifyRes = await fetch(`${API_URL}/api/verify-payment`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(response)
-                });
-                const verifyData = await verifyRes.json();
-                
-                if (verifyData.status === 'success') {
-                    alert("Payment Successful! Welcome to " + planName);
-                    // Redirect to dashboard
-                    // window.location.href = "/dashboard.html";
-                } else {
-                    alert("Payment verification failed.");
-                }
-            },
-            "theme": { "color": "#3399cc" }
-        };
-        var rzp1 = new Razorpay(options);
-        rzp1.open();
-    } catch (err) {
-        console.error("Payment failed:", err);
-        alert("Could not initiate payment. Check console.");
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
+            });
+            const data = await res.json();
+
+            if (res.ok) {
+                // Save user info to LocalStorage to keep them "logged in" on frontend
+                localStorage.setItem('user', JSON.stringify(data.user));
+                alert("Login Successful!");
+                window.location.href = "dashboard.html"; // Redirect to dashboard
+            } else {
+                alert(data.error);
+            }
+        } catch (err) {
+            console.error(err);
+            alert("Login failed. Check console.");
+        }
+    });
+}
+
+// --- 3. REGISTER LOGIC ---
+// Ensure your Register HTML form has id="register-form"
+const registerForm = document.getElementById('register-form');
+if (registerForm) {
+    registerForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const name = document.getElementById('name').value;
+        const email = document.getElementById('email').value;
+        const password = document.getElementById('password').value;
+
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, email, password })
+            });
+            const data = await res.json();
+
+            if (res.ok) {
+                alert("Account created! Please login.");
+                window.location.href = "login.html";
+            } else {
+                alert(data.error);
+            }
+        } catch (err) {
+            console.error(err);
+            alert("Registration failed.");
+        }
+    });
+}
+
+// --- 4. DASHBOARD CHECK ---
+// Add this to dashboard.html script section to protect it
+if (window.location.pathname.includes('dashboard.html')) {
+    const user = JSON.parse(localStorage.getItem('user'));
+    if (!user) {
+        alert("You must be logged in to view this page.");
+        window.location.href = "login.html";
+    } else {
+        // Optional: Display user name
+        const userNameDisplay = document.getElementById('user-name-display');
+        if (userNameDisplay) userNameDisplay.innerText = user.name;
     }
-}
-
-// Attach Payment Function to Buttons (Add IDs to your buttons in HTML)
-const growthBtn = document.getElementById('buy-growth');
-if (growthBtn) {
-    growthBtn.onclick = () => initiatePayment(29999, "Growth Plan");
-}
-
-const starterBtn = document.getElementById('buy-starter');
-if (starterBtn) {
-    starterBtn.onclick = () => initiatePayment(9999, "Starter Plan");
 }
