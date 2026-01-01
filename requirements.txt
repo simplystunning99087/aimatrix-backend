@@ -2,10 +2,8 @@ flask
 flask-sqlalchemy
 flask-cors
 flask-login
-razorpay
 gunicorn
 psycopg2-binary
 werkzeug
 python-dotenv
 email-validator
-
