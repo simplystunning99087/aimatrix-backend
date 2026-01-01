@@ -115,3 +115,35 @@ if (window.location.pathname.includes('dashboard.html')) {
         if (userNameDisplay) userNameDisplay.innerText = user.name;
     }
 }
+
+// --- 5. SYSTEM STATUS CHECKER ---
+// This runs automatically when the page loads
+async function checkSystemStatus() {
+    const statusText = document.getElementById('system-status') || document.getElementById('backend-status'); 
+    const statusIcon = document.getElementById('status-icon'); // If you have an icon
+    
+    // Check if elements exist to avoid errors
+    if (!statusText) return;
+
+    statusText.innerText = "Checking connection...";
+    
+    try {
+        // We fetch the root URL which returns {status: "active"}
+        const res = await fetch(`${API_BASE_URL}/`);
+        
+        if (res.ok) {
+            statusText.innerText = "Online & Operational";
+            statusText.style.color = "green";
+            if(statusIcon) statusIcon.style.color = "green";
+        } else {
+            throw new Error("Backend returned error");
+        }
+    } catch (err) {
+        console.error("Health check failed:", err);
+        statusText.innerText = "System Offline (Maintenance)";
+        statusText.style.color = "red";
+    }
+}
+
+// Run the check immediately
+checkSystemStatus();
