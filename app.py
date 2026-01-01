@@ -11,7 +11,7 @@ app = Flask(__name__)
 
 # CORS: Allow requests from your frontend
 # Replace '*' with 'https://frontend-aimatrix.vercel.app' for better security in production
-CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Secret Key (Set this in Render Environment Variables)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
