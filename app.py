@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -9,9 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # --- CONFIGURATION ---
 app = Flask(__name__)
 
-# CORS: Allow requests from your frontend
-# Replace '*' with 'https://frontend-aimatrix.vercel.app' for better security in production
-# ALLOW your Vercel URL and Localhost (for testing)
+# Allow requests from your Vercel Frontend and Localhost
 CORS(app, resources={r"/*": {
     "origins": [
         "https://frontend-aimatrix.vercel.app", 
@@ -19,10 +17,9 @@ CORS(app, resources={r"/*": {
         "http://localhost:5500"
     ]
 }}, supports_credentials=True)
-# Secret Key (Set this in Render Environment Variables)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
 
-# Database Config (Uses SQLite locally, Postgres on Render if configured)
+# Secret Key & Database
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///aimatrix.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -52,24 +49,17 @@ def load_user(user_id):
 
 @app.route('/')
 def home():
-    return jsonify({"status": "active", "message": "AIMatrix Commercial Backend Ready"})
+    return jsonify({"status": "active", "message": "AIMatrix Backend Online"})
 
 # 1. REGISTER
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
-    
-    # Check if user exists
     if User.query.filter_by(email=data.get('email')).first():
         return jsonify({'error': 'Email already exists'}), 400
     
-    # Create new user
     hashed_pw = generate_password_hash(data.get('password'), method='pbkdf2:sha256')
-    new_user = User(
-        email=data.get('email'),
-        name=data.get('name'),
-        password=hashed_pw
-    )
+    new_user = User(email=data.get('email'), name=data.get('name'), password=hashed_pw)
     
     try:
         db.session.add(new_user)
@@ -83,28 +73,12 @@ def register():
 def login():
     data = request.json
     user = User.query.filter_by(email=data.get('email')).first()
-    
     if user and check_password_hash(user.password, data.get('password')):
         login_user(user)
-        return jsonify({
-            'message': 'Login successful',
-            'user': {
-                'id': user.id,
-                'name': user.name,
-                'email': user.email
-            }
-        })
-    
-    return jsonify({'error': 'Invalid email or password'}), 401
+        return jsonify({'message': 'Login successful', 'user': {'name': user.name, 'email': user.email}})
+    return jsonify({'error': 'Invalid credentials'}), 401
 
-# 3. LOGOUT
-@app.route('/api/logout', methods=['POST'])
-@login_required
-def logout():
-    logout_user()
-    return jsonify({'message': 'Logged out successfully'})
-
-# 4. CONTACT FORM (Commercial Lead Gen)
+# 3. CONTACT FORM
 @app.route('/api/contact', methods=['POST'])
 def contact():
     data = request.json
@@ -116,19 +90,97 @@ def contact():
         )
         db.session.add(new_msg)
         db.session.commit()
-        return jsonify({'message': 'Message received. We will contact you shortly.'}), 200
+        return jsonify({'success': True, 'message': 'Message received'})
     except Exception as e:
-        return jsonify({'error': 'Failed to save message'}), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-# 5. PROTECTED DASHBOARD DATA
-@app.route('/api/user-data', methods=['GET'])
-@login_required
-def get_user_data():
-    return jsonify({
-        'name': current_user.name,
-        'email': current_user.email,
-        'account_status': 'Active'
-    })
+# --- NEW: ADMIN DASHBOARD ROUTE ---
+@app.route('/admin')
+def admin_panel():
+    # Fetch all data from database
+    users = User.query.order_by(User.created_at.desc()).all()
+    messages = ContactMessage.query.order_by(ContactMessage.date.desc()).all()
+    
+    # HTML Template for the Dashboard
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AIMatrix Admin</title>
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+        <style>
+            body { font-family: 'Poppins', sans-serif; background: #f4f6f8; padding: 40px; }
+            .container { max-width: 1000px; margin: 0 auto; }
+            h1 { color: #f43f5e; margin-bottom: 30px; }
+            .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 30px; }
+            h2 { font-size: 1.2rem; margin-bottom: 20px; border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; }
+            table { width: 100%; border-collapse: collapse; }
+            th { text-align: left; color: #666; font-size: 14px; padding: 10px; border-bottom: 1px solid #eee; }
+            td { padding: 12px 10px; border-bottom: 1px solid #f9f9f9; color: #333; font-size: 14px; }
+            .empty { color: #999; font-style: italic; }
+            .badge { background: #e0f2fe; color: #0284c7; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 AIMatrix Admin</h1>
+            
+            <div class="card">
+                <h2>📥 Recent Messages ({{ messages|length }})</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th width="150">Date</th>
+                            <th>Name</th>
+                            <th>Email</th>
+                            <th>Message</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for msg in messages %}
+                        <tr>
+                            <td>{{ msg.date.strftime('%Y-%m-%d %H:%M') }}</td>
+                            <td><strong>{{ msg.name }}</strong></td>
+                            <td>{{ msg.email }}</td>
+                            <td>{{ msg.message }}</td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="empty">No messages yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>👥 Registered Users ({{ users|length }})</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Joined</th>
+                            <th>Name</th>
+                            <th>Email</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for user in users %}
+                        <tr>
+                            <td>{{ user.created_at.strftime('%Y-%m-%d') }}</td>
+                            <td>{{ user.name }}</td>
+                            <td>{{ user.email }}</td>
+                            <td><span class="badge">Active</span></td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="empty">No users registered yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template, users=users, messages=messages)
 
 # Initialize DB
 with app.app_context():
