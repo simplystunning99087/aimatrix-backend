@@ -10,7 +10,15 @@ app.secret_key = os.environ.get('SECRET_KEY', 'secret-key')
 
 # Allow your Vercel frontend
 # CORS: Allow ALL origins (Fixes connection issues)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# CORS: You MUST list the specific URL to allow login/admin to work
+CORS(app, resources={r"/*": {
+    "origins": [
+        "https://frontend-aimatrix.vercel.app",
+        "https://frontend-aimatrix.vercel.app/",
+        "http://127.0.0.1:5500",
+        "http://localhost:5500"
+    ]
+}}, supports_credentials=True)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///aimatrix.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
